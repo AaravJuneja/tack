@@ -1,8 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 
 interface Env {
-  BUCKET: R2Bucket;
   LIVE: DurableObjectNamespace<Live>;
+  STORE: DurableObjectNamespace<Store>;
   TACK_TOKEN?: string;
   DOCS_HOST?: string;
   LIST_HOST?: string;
@@ -56,7 +56,7 @@ type LiveState = {
 };
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
-const MAX_FILES = 200;
+const BLOB_CHUNK_BYTES = 4 * 1024 * 1024;
 const RESERVED_SLUGS = new Set(["api", "login", "cli", "install"]);
 const RESERVED_PATHS = new Set(["v", "_history", "_diff", "_live"]);
 const HASH_RE = /^[0-9a-f]{64}$/;
@@ -69,8 +69,8 @@ const liveState = (meta: Meta): LiveState => {
   const ns = meta.versions.map((v) => v.n);
   return { gen: meta.gen ?? 0, rev: meta.rev ?? 0, ns, latest: ns.at(-1), count: ns.length };
 };
-const metaKey = (slug: string) => `meta/${slug}.json`;
-const blobKey = (slug: string, hash: string) => `blobs/${slug}/${hash}`;
+type StoredMeta = { meta: Meta; etag: string };
+type MetaCondition = { etagMatches?: string; createOnly?: boolean };
 
 function bye(ws: WebSocket) {
   try {
@@ -133,8 +133,241 @@ export class Live extends DurableObject<Env> {
   }
 }
 
+export class Store extends DurableObject<Env> {
+  sql = this.ctx.storage.sql;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS docs (
+      slug TEXT PRIMARY KEY,
+      meta TEXT NOT NULL,
+      etag TEXT NOT NULL,
+      title TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      latest INTEGER NOT NULL,
+      versions INTEGER NOT NULL,
+      is_private INTEGER NOT NULL
+    )`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS blobs (
+      slug TEXT NOT NULL,
+      hash TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      PRIMARY KEY (slug, hash)
+    )`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS blob_chunks (
+      slug TEXT NOT NULL,
+      hash TEXT NOT NULL,
+      part INTEGER NOT NULL,
+      data BLOB NOT NULL,
+      PRIMARY KEY (slug, hash, part)
+    )`);
+  }
+
+  getMeta(slug: string): string | null {
+    const row = this.sql.exec<{ meta: string; etag: string }>("SELECT meta, etag FROM docs WHERE slug = ?", slug).toArray()[0];
+    return row ? JSON.stringify({ meta: JSON.parse(row.meta), etag: row.etag }) : null;
+  }
+
+  saveMeta(json: string, etagMatches: string | null, createOnly: boolean): string | null {
+    const meta = JSON.parse(json) as Meta;
+    return this.ctx.storage.transactionSync(() => {
+      const current = this.sql.exec<{ etag: string }>("SELECT etag FROM docs WHERE slug = ?", meta.slug).toArray()[0];
+      if (createOnly ? current : etagMatches !== null && current?.etag !== etagMatches) return null;
+      const etag = crypto.randomUUID();
+      this.sql.exec(
+        `INSERT INTO docs (slug, meta, etag, title, updated_at, latest, versions, is_private)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(slug) DO UPDATE SET meta = excluded.meta, etag = excluded.etag,
+           title = excluded.title, updated_at = excluded.updated_at, latest = excluded.latest,
+           versions = excluded.versions, is_private = excluded.is_private`,
+        meta.slug,
+        json,
+        etag,
+        meta.title,
+        meta.updatedAt,
+        meta.versions.at(-1)?.n ?? 0,
+        meta.versions.length,
+        Number(Boolean(meta.private)),
+      );
+      return etag;
+    });
+  }
+
+  deleteMeta(slug: string, etag: string): boolean {
+    return this.ctx.storage.transactionSync(() => {
+      const current = this.sql.exec<{ etag: string }>("SELECT etag FROM docs WHERE slug = ?", slug).toArray()[0];
+      if (current?.etag !== etag) return false;
+      this.sql.exec("DELETE FROM docs WHERE slug = ?", slug);
+      return true;
+    });
+  }
+
+  listDocs(): string {
+    const rows = this.sql
+      .exec<{ slug: string; title: string; updated_at: string; latest: number; versions: number; is_private: number }>(
+        "SELECT slug, title, updated_at, latest, versions, is_private FROM docs ORDER BY updated_at DESC, slug",
+      )
+      .toArray();
+    return JSON.stringify(
+      rows.map((r): DocSummary => ({
+        slug: r.slug,
+        title: r.title,
+        updatedAt: r.updated_at,
+        latest: r.latest,
+        versions: r.versions,
+        private: Boolean(r.is_private),
+      })),
+    );
+  }
+
+  hasBlobs(slug: string, hashes: string[]): string[] {
+    const found: string[] = [];
+    for (const batch of batches(hashes)) {
+      const rows = this.sql.exec<{ hash: string }>(`SELECT hash FROM blobs WHERE slug = ? AND hash IN (${marks(batch)})`, slug, ...batch);
+      for (const row of rows) found.push(row.hash);
+    }
+    return found;
+  }
+
+  async putBlob(slug: string, hash: string, body: ReadableStream<Uint8Array> | ArrayBuffer | null): Promise<boolean> {
+    if (this.blobSize(slug, hash) !== null) {
+      if (body instanceof ReadableStream) await body.cancel();
+      return true;
+    }
+    const temp = `${hash}.${crypto.randomUUID()}`;
+    const digest = new crypto.DigestStream("SHA-256");
+    const writer = digest.getWriter();
+    const buf = new Uint8Array(BLOB_CHUNK_BYTES);
+    let fill = 0;
+    let part = 0;
+    let size = 0;
+    const flush = () => {
+      if (!fill) return;
+      this.sql.exec("INSERT INTO blob_chunks (slug, hash, part, data) VALUES (?, ?, ?, ?)", slug, temp, part++, buf.slice(0, fill).buffer);
+      fill = 0;
+    };
+    const add = async (chunk: Uint8Array) => {
+      await writer.write(chunk);
+      size += chunk.byteLength;
+      for (let at = 0; at < chunk.byteLength; ) {
+        const n = Math.min(chunk.byteLength - at, BLOB_CHUNK_BYTES - fill);
+        buf.set(chunk.subarray(at, at + n), fill);
+        fill += n;
+        at += n;
+        if (fill === BLOB_CHUNK_BYTES) flush();
+      }
+    };
+    try {
+      if (body instanceof ReadableStream) for await (const chunk of body) await add(chunk);
+      else if (body) await add(new Uint8Array(body));
+      flush();
+      await writer.close();
+      if (hex(await digest.digest) !== hash) {
+        this.sql.exec("DELETE FROM blob_chunks WHERE slug = ? AND hash = ?", slug, temp);
+        return false;
+      }
+    } catch (err) {
+      this.sql.exec("DELETE FROM blob_chunks WHERE slug = ? AND hash = ?", slug, temp);
+      throw err;
+    }
+    this.ctx.storage.transactionSync(() => {
+      if (this.blobSize(slug, hash) !== null) {
+        this.sql.exec("DELETE FROM blob_chunks WHERE slug = ? AND hash = ?", slug, temp);
+        return;
+      }
+      this.sql.exec("UPDATE blob_chunks SET hash = ? WHERE slug = ? AND hash = ?", hash, slug, temp);
+      this.sql.exec("INSERT INTO blobs (slug, hash, size) VALUES (?, ?, ?)", slug, hash, size);
+    });
+    return true;
+  }
+
+  getBlob(slug: string, hash: string, limit = Number.MAX_SAFE_INTEGER): ReadableStream<Uint8Array> | null {
+    if (this.blobSize(slug, hash) === null) return null;
+    let part = 0;
+    let left = limit;
+    return new ReadableStream({
+      type: "bytes",
+      pull: (controller) => {
+        const row =
+          left > 0
+            ? this.sql
+                .exec<{ data: ArrayBuffer }>("SELECT data FROM blob_chunks WHERE slug = ? AND hash = ? AND part = ?", slug, hash, part++)
+                .toArray()[0]
+            : undefined;
+        if (!row) return controller.close();
+        const bytes = new Uint8Array(row.data, 0, Math.min(row.data.byteLength, left));
+        left -= bytes.byteLength;
+        controller.enqueue(bytes);
+      },
+    });
+  }
+
+  deleteBlobs(slug: string) {
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec("DELETE FROM blob_chunks WHERE slug = ?", slug);
+      this.sql.exec("DELETE FROM blobs WHERE slug = ?", slug);
+    });
+  }
+
+  copyBlobs(from: string, to: string, versionsJson: string): boolean {
+    const versions = JSON.parse(versionsJson) as Version[];
+    const hashes = new Set<string>();
+    for (const v of versions) {
+      if (v.files) for (const h of Object.values(v.files)) hashes.add(h);
+      if (!v.manifest) continue;
+      hashes.add(v.manifest);
+      const text = this.readText(from, v.manifest);
+      if (text === null) return false;
+      for (const h of Object.values(JSON.parse(text) as Files)) hashes.add(h);
+    }
+    const list = [...hashes];
+    return this.ctx.storage.transactionSync(() => {
+      let found = 0;
+      for (const batch of batches(list)) {
+        found += this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM blobs WHERE slug = ? AND hash IN (${marks(batch)})`, from, ...batch).one().n;
+      }
+      if (found !== list.length) return false;
+      this.sql.exec("DELETE FROM blob_chunks WHERE slug = ?", to);
+      this.sql.exec("DELETE FROM blobs WHERE slug = ?", to);
+      for (const batch of batches(list)) {
+        this.sql.exec(`INSERT INTO blobs (slug, hash, size) SELECT ?, hash, size FROM blobs WHERE slug = ? AND hash IN (${marks(batch)})`, to, from, ...batch);
+        this.sql.exec(
+          `INSERT INTO blob_chunks (slug, hash, part, data) SELECT ?, hash, part, data FROM blob_chunks WHERE slug = ? AND hash IN (${marks(batch)})`,
+          to,
+          from,
+          ...batch,
+        );
+      }
+      return true;
+    });
+  }
+
+  private blobSize(slug: string, hash: string): number | null {
+    return this.sql.exec<{ size: number }>("SELECT size FROM blobs WHERE slug = ? AND hash = ?", slug, hash).toArray()[0]?.size ?? null;
+  }
+
+  private readText(slug: string, hash: string): string | null {
+    if (this.blobSize(slug, hash) === null) return null;
+    const rows = this.sql.exec<{ data: ArrayBuffer }>("SELECT data FROM blob_chunks WHERE slug = ? AND hash = ? ORDER BY part", slug, hash);
+    const decoder = new TextDecoder();
+    let text = "";
+    for (const row of rows) text += decoder.decode(row.data, { stream: true });
+    return text + decoder.decode();
+  }
+}
+
+const batches = (items: string[], size = 90) => Array.from({ length: Math.ceil(items.length / size) }, (_, i) => items.slice(i * size, (i + 1) * size));
+const marks = (items: string[]) => items.map(() => "?").join(",");
+const hex = (buf: ArrayBuffer) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+
 const live = (env: Env, slug: string) => env.LIVE.get(env.LIVE.idFromName(slug));
+const store = (env: Env) => env.STORE.get(env.STORE.idFromName("tack"));
 const LIST_LIVE = "__list__";
+
+async function storedMeta(env: Env, slug: string): Promise<StoredMeta | null> {
+  const value = await store(env).getMeta(slug);
+  return value ? (JSON.parse(value) as StoredMeta) : null;
+}
 
 function withScope(req: Request, scope: "public" | "private" | "list"): Request {
   const headers = new Headers(req.headers);
@@ -166,7 +399,10 @@ export default {
       if (res.webSocket) return res;
     } catch (err) {
       console.error(err);
-      res = text(`tack: internal error: ${err instanceof Error ? err.message : String(err)}`, 500);
+      const message = err instanceof Error ? err.message : String(err);
+      if (/SQLITE_FULL|database or disk is full|exceeded.*storage/i.test(message)) res = fail(507, "Cloudflare storage is full");
+      else if (/SQLITE_TOOBIG|too big/i.test(message)) res = fail(413, "too big for Cloudflare's SQLite row limit");
+      else res = text(`tack: internal error: ${message}`, 500);
     }
     const out = new Response(res.body, res);
     out.headers.set("x-robots-tag", "noindex, nofollow");
@@ -397,12 +633,11 @@ async function blocked(env: Env, meta: Meta): Promise<string | null> {
 
 async function putBlob(req: Request, env: Env, slug: string, hash: string): Promise<Response> {
   if (!SLUG_RE.test(slug)) return fail(400, "bad slug");
-  const length = Number(req.headers.get("content-length"));
-  const body = length > 0 && req.body ? req.body : await req.arrayBuffer();
   try {
-    await env.BUCKET.put(blobKey(slug, hash), body, { sha256: hash });
+    if (!(await store(env).putBlob(slug, hash, req.body))) return fail(400, "file contents don't match their hash");
   } catch (err) {
-    return /checksum|10037/i.test(String(err)) ? fail(400, "file contents don't match their hash") : fail(503, "storage busy; retry");
+    if ((err as { retryable?: boolean }).retryable || /overloaded/i.test(String(err))) return fail(503, "storage busy; retry");
+    throw err;
   }
   return json({ ok: true });
 }
@@ -414,7 +649,6 @@ async function upload(req: Request, env: Env, url: URL, slug: string): Promise<R
   const body = await req.json<UploadBody>().catch(() => null);
   if (!body?.files || typeof body.files !== "object") return fail(400, "expected JSON { files: { path: sha256 } }");
   const entries = Object.entries(body.files);
-  if (entries.length > MAX_FILES) return fail(413, `an upload can have at most ${MAX_FILES} files`);
 
   const files: Record<string, string> = Object.create(null);
   for (const [raw, hash] of entries) {
@@ -438,10 +672,10 @@ async function upload(req: Request, env: Env, url: URL, slug: string): Promise<R
   let lifecycle = "";
   for (let attempt = 0; attempt < 5; attempt++) {
     const now = new Date().toISOString();
-    const existing = await env.BUCKET.get(metaKey(slug));
+    const existing = await storedMeta(env, slug);
     if (existing && body.create) return fail(409, `slug "${slug}" is already taken`);
     const meta: Meta = existing
-      ? await existing.json<Meta>()
+      ? existing.meta
       : { slug, title: slug, createdAt: now, updatedAt: now, versions: [] };
     const current = existing ? `${meta.gen ?? 0}:${meta.createdAt}` : "new";
     if (current !== lifecycle) present.clear();
@@ -468,8 +702,7 @@ async function upload(req: Request, env: Env, url: URL, slug: string): Promise<R
 
     const known = new Set(meta.versions.flatMap((v) => Object.values(v.files ?? {})));
     const fresh = [...new Set(Object.values(files))].filter((h) => !known.has(h) && !present.has(h));
-    const heads = await Promise.all(fresh.map((h) => env.BUCKET.head(blobKey(slug, h))));
-    fresh.forEach((h, i) => heads[i] && present.add(h));
+    for (const hash of await store(env).hasBlobs(slug, fresh)) present.add(hash);
     const missing = fresh.filter((h) => !present.has(h));
     if (missing.length) return json({ ok: false, error: "upload these files first", missing }, 428);
 
@@ -485,7 +718,7 @@ async function upload(req: Request, env: Env, url: URL, slug: string): Promise<R
     meta.updatedAt = now;
     meta.private = wantPrivate;
 
-    const saved = await saveMeta(env, meta, existing ? { etagMatches: existing.etag } : new Headers({ "if-none-match": "*" }));
+    const saved = await saveMeta(env, meta, existing ? { etagMatches: existing.etag } : { createOnly: true });
     if (saved) {
       await notify(env, slug, liveState(meta), meta.private);
       return json(receipt(docsOrigin(env, url, meta.private), meta, version, false), existing ? 200 : 201);
@@ -502,7 +735,7 @@ async function compact(env: Env, slug: string, versions: Version[]) {
       const files = v.files!;
       const body = new TextEncoder().encode(JSON.stringify(Object.fromEntries(Object.keys(files).sort().map((p) => [p, files[p]]))));
       const hash = await sha256(body);
-      await env.BUCKET.put(blobKey(slug, hash), body, { sha256: hash });
+      await store(env).putBlob(slug, hash, body.buffer as ArrayBuffer);
       v.manifest = hash;
       v.count = Object.keys(files).length;
       delete v.files;
@@ -513,14 +746,8 @@ async function compact(env: Env, slug: string, versions: Version[]) {
 async function filesOf(env: Env, ctx: ExecutionContext | null, slug: string, v: Version): Promise<Files | null> {
   if (v.files) return Object.assign(Object.create(null), v.files);
   if (!v.manifest) return null;
-  let text: string | null = null;
-  if (ctx) {
-    const body = await readBlob(env, ctx, slug, v.manifest);
-    text = body ? await new Response(body).text() : null;
-  } else {
-    text = (await (await env.BUCKET.get(blobKey(slug, v.manifest)))?.text()) ?? null;
-  }
-  return text === null ? null : Object.assign(Object.create(null), JSON.parse(text));
+  const body = ctx ? await readBlob(env, ctx, slug, v.manifest) : await store(env).getBlob(slug, v.manifest);
+  return body ? Object.assign(Object.create(null), await new Response(body).json()) : null;
 }
 
 function receipt(origin: string, meta: Meta, v: Version, unchanged: boolean) {
@@ -539,58 +766,38 @@ function receipt(origin: string, meta: Meta, v: Version, unchanged: boolean) {
   };
 }
 
-async function saveMeta(env: Env, meta: Meta, onlyIf: R2Conditional | Headers): Promise<R2Object | null> {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await env.BUCKET.put(metaKey(meta.slug), JSON.stringify(meta), {
-        onlyIf,
-        httpMetadata: { contentType: "application/json" },
-        customMetadata: {
-          title: encodeURIComponent(meta.title.slice(0, 120).toWellFormed()),
-          updatedAt: meta.updatedAt,
-          latest: String(meta.versions.at(-1)!.n),
-          versions: String(meta.versions.length),
-          ...(meta.private && { private: "1" }),
-        },
-      });
-    } catch (err) {
-      if (attempt >= 3) throw err;
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-  }
+async function saveMeta(env: Env, meta: Meta, condition: MetaCondition): Promise<{ etag: string } | null> {
+  const etag = await store(env).saveMeta(JSON.stringify(meta), condition.etagMatches ?? null, Boolean(condition.createOnly));
+  return etag ? { etag } : null;
 }
 
 async function remove(env: Env, slug: string): Promise<Response> {
-  const obj = SLUG_RE.test(slug) ? await env.BUCKET.get(metaKey(slug)) : null;
-  if (!obj) return fail(404, `no doc called "${slug}"`);
-  const meta = await obj.json<Meta>();
+  const stored = SLUG_RE.test(slug) ? await storedMeta(env, slug) : null;
+  if (!stored) return fail(404, `no doc called "${slug}"`);
+  const meta = stored.meta;
   if (meta.lock && Date.now() - meta.lock.at < LOCK_MS) return fail(409, `${slug} is ${meta.lock.reason}; retry in a moment`);
   if (meta.lock?.to && meta.lock.phase !== "cleanup" && (await getMeta(env, meta.lock.to))?.lock?.from === slug) {
     return fail(409, `an unfinished rename left a half-made copy at ${meta.lock.to}; run \`tack rm ${meta.lock.to}\` first, which keeps ${slug}`);
   }
-  if (!(await saveMeta(env, { ...meta, lock: { reason: "being deleted", at: Date.now() } }, { etagMatches: obj.etag }))) {
+  const locked = await saveMeta(env, { ...meta, lock: { reason: "being deleted", at: Date.now() } }, { etagMatches: stored.etag });
+  if (!locked) {
     return fail(409, `${slug} changed while deleting; retry`);
   }
   await deleteBlobs(env, slug);
-  await env.BUCKET.delete(metaKey(slug));
+  await store(env).deleteMeta(slug, locked.etag);
   await notify(env, slug, { gen: meta.gen ?? 0, rev: (meta.rev ?? 0) + 1, deleted: true }, meta.private);
   return json({ ok: true, slug, deleted: true });
 }
 
 async function deleteBlobs(env: Env, slug: string) {
-  let cursor: string | undefined;
-  do {
-    const page = await env.BUCKET.list({ prefix: `blobs/${slug}/`, cursor });
-    if (page.objects.length) await env.BUCKET.delete(page.objects.map((o) => o.key));
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor);
+  await store(env).deleteBlobs(slug);
 }
 
 async function removeVersion(env: Env, slug: string, n: number): Promise<Response> {
   for (let attempt = 0; attempt < 5; attempt++) {
-    const obj = SLUG_RE.test(slug) ? await env.BUCKET.get(metaKey(slug)) : null;
-    if (!obj) return fail(404, `no doc called "${slug}"`);
-    const meta = await obj.json<Meta>();
+    const stored = SLUG_RE.test(slug) ? await storedMeta(env, slug) : null;
+    if (!stored) return fail(404, `no doc called "${slug}"`);
+    const meta = stored.meta;
     const lock = await blocked(env, meta);
     if (lock) return fail(409, lock);
     const i = meta.versions.findIndex((v) => v.n === n);
@@ -609,7 +816,7 @@ async function removeVersion(env: Env, slug: string, n: number): Promise<Respons
     }
     meta.rev = (meta.rev ?? 0) + 1;
     meta.updatedAt = new Date().toISOString();
-    if (await saveMeta(env, meta, { etagMatches: obj.etag })) {
+    if (await saveMeta(env, meta, { etagMatches: stored.etag })) {
       await notify(env, slug, liveState(meta), meta.private);
       return json({ ok: true, slug, deleted: n, latest: meta.versions.at(-1)!.n });
     }
@@ -620,22 +827,15 @@ async function removeVersion(env: Env, slug: string, n: number): Promise<Respons
 async function rename(req: Request, env: Env, url: URL, slug: string): Promise<Response> {
   const to = ((await req.json<{ to?: string }>().catch(() => null))?.to ?? "").toLowerCase();
   if (!SLUG_RE.test(to) || RESERVED_SLUGS.has(to)) return fail(400, `"${to}" isn't a valid slug`);
-  const obj = SLUG_RE.test(slug) ? await env.BUCKET.get(metaKey(slug)) : null;
-  if (!obj) return fail(404, `no doc called "${slug}"`);
-  if (await env.BUCKET.head(metaKey(to))) return fail(409, `slug "${to}" is already taken`);
-  const meta = await obj.json<Meta>();
+  const stored = SLUG_RE.test(slug) ? await storedMeta(env, slug) : null;
+  if (!stored) return fail(404, `no doc called "${slug}"`);
+  if (await storedMeta(env, to)) return fail(409, `slug "${to}" is already taken`);
+  const meta = stored.meta;
   const lock = await blocked(env, meta);
   if (lock) return fail(409, lock);
-  if (meta.versions.filter((v) => !v.files).length > 100) return fail(413, `${slug} has too many versions to rename`);
-  const lists = await Promise.all(meta.versions.map((v) => filesOf(env, null, slug, v)));
-  if (lists.includes(null)) return fail(500, `${slug} is missing stored files; not renamed`);
-  const hashes = [
-    ...new Set([...lists.flatMap((f) => Object.values(f!)), ...meta.versions.flatMap((v) => (v.manifest ? [v.manifest] : []))]),
-  ];
-  if (hashes.length > MAX_FILES * 2) return fail(413, `${slug} has too many files to rename`);
 
   const sourceLock = { reason: `being renamed to ${to}`, at: Date.now(), to };
-  const locked = await saveMeta(env, { ...meta, lock: sourceLock }, { etagMatches: obj.etag });
+  const locked = await saveMeta(env, { ...meta, lock: sourceLock }, { etagMatches: stored.etag });
   if (!locked) return fail(409, `${slug} changed while renaming; retry`);
   const unlock = () => saveMeta(env, meta, { etagMatches: locked.etag }).catch(() => null);
 
@@ -650,7 +850,7 @@ async function rename(req: Request, env: Env, url: URL, slug: string): Promise<R
   const reserved = await saveMeta(
     env,
     { ...moved, lock: { reason: `being renamed from ${slug}`, at: Date.now(), from: slug } },
-    new Headers({ "if-none-match": "*" }),
+    { createOnly: true },
   );
   if (!reserved) {
     await unlock();
@@ -658,24 +858,13 @@ async function rename(req: Request, env: Env, url: URL, slug: string): Promise<R
   }
   const abandon = async () => {
     await deleteBlobs(env, to);
-    await env.BUCKET.delete(metaKey(to));
+    await store(env).deleteMeta(to, reserved.etag);
     await unlock();
   };
   try {
-    for (let i = 0; i < hashes.length; i += 4) {
-      const batch = await Promise.all(
-        hashes.slice(i, i + 4).map(async (h) => {
-          const blob = await env.BUCKET.get(blobKey(slug, h));
-          if (!blob) return false;
-          const { readable, writable } = new FixedLengthStream(blob.size);
-          await Promise.all([blob.body.pipeTo(writable), env.BUCKET.put(blobKey(to, h), readable)]);
-          return true;
-        }),
-      );
-      if (batch.includes(false)) {
-        await abandon();
-        return fail(500, `${slug} is missing stored files; not renamed`);
-      }
+    if (!(await store(env).copyBlobs(slug, to, JSON.stringify(meta.versions)))) {
+      await abandon();
+      return fail(500, `${slug} is missing stored files; not renamed`);
     }
     if (!(await saveMeta(env, moved, { etagMatches: reserved.etag }))) {
       await abandon();
@@ -690,41 +879,18 @@ async function rename(req: Request, env: Env, url: URL, slug: string): Promise<R
   const cleanup = await saveMeta(env, { ...meta, lock: { ...sourceLock, at: Date.now(), phase: "cleanup" } }, { etagMatches: locked.etag });
   if (!cleanup) return fail(500, `renamed to ${to}, but couldn't clean up ${slug}; run \`tack rm ${slug}\``);
   await deleteBlobs(env, slug);
-  await env.BUCKET.delete(metaKey(slug));
+  await store(env).deleteMeta(slug, cleanup.etag);
   await notify(env, slug, { gen: meta.gen ?? 0, rev: (meta.rev ?? 0) + 1, moved: to }, meta.private);
   return json({ ok: true, from: slug, slug: to, url: `${docsOrigin(env, url, meta.private)}/${to}` });
 }
 
 async function getMeta(env: Env, slug: string): Promise<Meta | null> {
   if (!SLUG_RE.test(slug)) return null;
-  const obj = await env.BUCKET.get(metaKey(slug));
-  return obj ? obj.json<Meta>() : null;
+  return (await storedMeta(env, slug))?.meta ?? null;
 }
 
 async function listDocs(env: Env): Promise<DocSummary[]> {
-  const docs: DocSummary[] = [];
-  let cursor: string | undefined;
-  do {
-    const page = await env.BUCKET.list({ prefix: "meta/", include: ["customMetadata"], cursor });
-    for (const o of page.objects) {
-      const m = o.customMetadata ?? {};
-      const slug = o.key.slice("meta/".length, -".json".length);
-      let title = slug;
-      try {
-        title = decodeURIComponent(m.title ?? "") || slug;
-      } catch {}
-      docs.push({
-        slug,
-        title,
-        updatedAt: m.updatedAt ?? o.uploaded.toISOString(),
-        latest: Number(m.latest ?? 0),
-        versions: Number(m.versions ?? 0),
-        private: m.private === "1",
-      });
-    }
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor);
-  return docs.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return JSON.parse(await store(env).listDocs()) as DocSummary[];
 }
 
 async function serveDoc(req: Request, env: Env, ctx: ExecutionContext, url: URL, scope: Scope): Promise<Response> {
@@ -733,9 +899,9 @@ async function serveDoc(req: Request, env: Env, ctx: ExecutionContext, url: URL,
   const visible = (isPrivate: boolean) => scope === "any" || (scope === "private") === isPrivate;
   if (rest === "/_live") {
     if (req.headers.get("upgrade") !== "websocket") return fail(426, "expected a websocket");
-    const head = await env.BUCKET.head(metaKey(slug));
-    const isPrivate = head?.customMetadata?.private === "1";
-    if (!head || !visible(isPrivate)) return fail(404, "not found");
+    const meta = await getMeta(env, slug);
+    const isPrivate = Boolean(meta?.private);
+    if (!meta || !visible(isPrivate)) return fail(404, "not found");
     return live(env, slug).fetch(withScope(req, isPrivate ? "private" : "public"));
   }
   const meta = await getMeta(env, slug);
@@ -819,9 +985,9 @@ async function readBlob(env: Env, ctx: ExecutionContext, slug: string, hash: str
   const key = new Request(`https://blob.tack/${slug}/${hash}`);
   const hit = await caches.default.match(key);
   if (hit?.body) return hit.body;
-  const obj = await env.BUCKET.get(blobKey(slug, hash));
-  if (!obj) return null;
-  const [mine, cached] = obj.body.tee();
+  const body = await store(env).getBlob(slug, hash);
+  if (!body) return null;
+  const [mine, cached] = body.tee();
   ctx.waitUntil(caches.default.put(key, new Response(cached, { headers: { "cache-control": "public, max-age=31536000, immutable" } })));
   return mine;
 }
@@ -1160,7 +1326,7 @@ async function diffPage(env: Env, ctx: ExecutionContext, meta: Meta, url: URL): 
 }
 
 type DiffResult = { added: number; removed: number; html: string; partial?: boolean; error?: string };
-const DIFF_REV = 5;
+const DIFF_REV = 6;
 const MAX_DIFF_BYTES = 100_000;
 const MAX_DIFF_LINES = 1000;
 
@@ -1178,10 +1344,11 @@ async function cachedDiff(
   let partial = false;
   const read = async (hash: string) => {
     if (!hash || hash === EMPTY_SHA256) return [];
-    const obj = await env.BUCKET.get(blobKey(slug, hash), { range: { length: MAX_DIFF_BYTES } });
-    if (!obj || !("body" in obj)) return null;
-    if (obj.size > MAX_DIFF_BYTES) partial = true;
-    const text = await obj.text();
+    const body = await store(env).getBlob(slug, hash, MAX_DIFF_BYTES + 1);
+    if (!body) return null;
+    const bytes = new Uint8Array(await new Response(body).arrayBuffer());
+    if (bytes.byteLength > MAX_DIFF_BYTES) partial = true;
+    const text = new TextDecoder().decode(bytes.subarray(0, MAX_DIFF_BYTES), { stream: true });
     const lines = isHtml ? textLines(text) : text.split(/\r?\n/);
     if (!isHtml && lines.at(-1) === "") lines.pop();
     if (lines.length > MAX_DIFF_LINES) partial = true;

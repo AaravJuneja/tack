@@ -6,13 +6,12 @@ An agent runs `tack upload plan.html` and replies with a link. Uploading again a
 - **Private docs.** `--private` docs live on a separate host behind Cloudflare Access, so only you can open them.
 - **Versions.** `/id` is the latest, `/id/v/2` is pinned, plus `/_history` and `/_diff`.
 - **Anything goes.** Served byte-for-byte: scripts, assets, multi-page folders.
-- **Free plan friendly.** One Worker, one R2 bucket, one Durable Object.
+- **Workers Free, no card.** Everything lives in SQLite-backed Durable Objects, so there's no R2 (or any other add-on) to subscribe to. The only limits are Cloudflare's: 100 MB per file (the request body limit on a free zone) and 5 GB of storage per account on Workers Free.
 
 ## Setup
 
-1. Create an R2 bucket named `tack`.
-2. Workers & Pages → Import this repo. Deploy command `bunx wrangler deploy`, build variable `BUN_VERSION=1.4.4`. This instance uses `tack.squeakyfiddlepro.me` for docs, `list.tack.squeakyfiddlepro.me` for the doc list, and `private.tack.squeakyfiddlepro.me` for optional private docs.
-3. Install the CLI and skill (running from the repo needs Node 22.18+):
+1. Workers & Pages → Import this repo. Deploy command `bunx wrangler deploy`, build variable `BUN_VERSION=1.4.4`. No bucket or other resource to create first: the first deploy creates the Durable Objects. This instance uses `tack.squeakyfiddlepro.me` for docs, `list.tack.squeakyfiddlepro.me` for the doc list, and `private.tack.squeakyfiddlepro.me` for optional private docs.
+2. Install the CLI and skill (running from the repo needs Node 22.18+):
 
 ```sh
 bun install
@@ -23,7 +22,7 @@ tack setup   # creates a token and sets it on the Worker
 tack open    # unlocks the doc list (list.tack.squeakyfiddlepro.me) in your browser
 ```
 
-4. Optional, for private docs: in Zero Trust → Access → Applications, add a self-hosted application for `private.tack.squeakyfiddlepro.me` (not "Protect this Worker", which breaks WebSockets) with a policy that allows only your email. Put your team domain (`https://<team>.cloudflareaccess.com`) and the application's AUD tag in `wrangler.jsonc` as `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`. Private docs stay disabled until all three of `PRIVATE_HOST`, `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` are set.
+3. Optional, for private docs: in Zero Trust → Access → Applications, add a self-hosted application for `private.tack.squeakyfiddlepro.me` (not "Protect this Worker", which breaks WebSockets) with a policy that allows only your email. Put your team domain (`https://<team>.cloudflareaccess.com`) and the application's AUD tag in `wrangler.jsonc` as `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`. Private docs stay disabled until all three of `PRIVATE_HOST`, `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` are set.
 
 Any other machine with Node 20+ installs the CLI and skill from your instance:
 

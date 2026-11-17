@@ -20,8 +20,14 @@
   "build": { "command": "bun run build" },
   "assets": { "directory": "./dist" },
 
-  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "tack" }],
-
-  "durable_objects": { "bindings": [{ "name": "LIVE", "class_name": "Live" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Live"] }]
+  "durable_objects": {
+    "bindings": [
+      { "name": "LIVE", "class_name": "Live" },
+      { "name": "STORE", "class_name": "Store" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Live"] },
+    { "tag": "v2", "new_sqlite_classes": ["Store"] }
+  ]
 }

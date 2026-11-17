@@ -11,8 +11,6 @@ import { parseArgs } from "node:util";
 const DEFAULT_URL = "https://tack.squeakyfiddlepro.me";
 const CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config"), "tack");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
-const MAX_UPLOAD_BYTES = 30 * 1024 * 1024;
-const MAX_FILES = 200;
 const isLocal = (host: string) => ["localhost", "127.0.0.1", "[::1]"].includes(host) || host.endsWith(".localhost");
 const common = { url: { type: "string" }, json: { type: "boolean" } } as const;
 
@@ -531,27 +529,21 @@ async function api<T>(cfg: Config, pathname: string, init?: RequestInit): Promis
   return body;
 }
 
-type Budget = { files: number; bytes: number };
-
 async function collect(abs: string): Promise<Record<string, Uint8Array>> {
   const st = await stat(abs).catch(() => null);
   if (!st) throw new Error(`no such file or folder: ${abs}`);
   const files: Record<string, Uint8Array> = Object.create(null);
-  const budget: Budget = { files: 0, bytes: 0 };
   if (st.isFile()) {
     if (!/\.html?$/i.test(abs)) throw new Error("upload an .html file, or a folder containing index.html");
-    await collectFile(abs, files, budget);
+    await collectFile(abs, files);
   } else {
     const root = await realpath(abs);
     for (const rel of await walk(abs)) {
-      const data = await readRegular(path.join(root, ...rel.split("/")), root, budget);
+      const data = await readRegular(path.join(root, ...rel.split("/")), root);
       if (data) files[rel] = data;
     }
     if (!Object.hasOwn(files, "index.html")) throw new Error(`${abs} has no index.html`);
   }
-  const total = Object.values(files).reduce((n, bytes) => n + bytes.byteLength, 0);
-  if (Object.keys(files).length > MAX_FILES) throw new Error(`more than ${MAX_FILES} files; that's the limit per upload`);
-  if (total > MAX_UPLOAD_BYTES) throw new Error(`the upload is ${(total / 1048576).toFixed(1)} MB; the limit is 30 MB`);
   return files;
 }
 
@@ -561,14 +553,13 @@ async function walk(dir: string, prefix = "", out: string[] = []): Promise<strin
     if (ent.name.includes("\\")) throw new Error(`file names with a backslash aren't supported: ${prefix}${ent.name}`);
     if (ent.isDirectory()) await walk(path.join(dir, ent.name), `${prefix}${ent.name}/`, out);
     else if (ent.isFile()) out.push(`${prefix}${ent.name}`);
-    if (out.length > MAX_FILES) throw new Error(`more than ${MAX_FILES} files; that's the limit per upload`);
   }
   return out;
 }
 
 const SKIPPABLE = new Set(["ENOENT", "ENOTDIR", "ELOOP", "EMLINK"]);
 
-async function readRegular(file: string, root: string, budget: Budget): Promise<Buffer | null> {
+async function readRegular(file: string, root: string): Promise<Buffer | null> {
   const skip = (err: unknown) => {
     if (SKIPPABLE.has((err as NodeJS.ErrnoException).code ?? "")) return null;
     throw new Error(`can't read ${file}: ${(err as Error).message}`);
@@ -582,12 +573,7 @@ async function readRegular(file: string, root: string, budget: Budget): Promise<
     if (!opened.isFile()) return null;
     const again = await stat(await realpath(file).catch(() => "")).catch(() => null);
     if (!again || again.ino !== opened.ino || again.dev !== opened.dev) return null;
-    if (budget.bytes + opened.size > MAX_UPLOAD_BYTES) throw new Error("the upload is over the 30 MB limit");
-    if (++budget.files > MAX_FILES) throw new Error(`more than ${MAX_FILES} files; that's the limit per upload`);
-    const data = await handle.readFile();
-    budget.bytes += data.byteLength;
-    if (budget.bytes > MAX_UPLOAD_BYTES) throw new Error("the upload is over the 30 MB limit");
-    return data;
+    return await handle.readFile();
   } finally {
     await handle.close();
   }
@@ -599,18 +585,17 @@ async function readStdin(): Promise<Record<string, Uint8Array>> {
   let size = 0;
   for await (const chunk of process.stdin) {
     size += chunk.length;
-    if (size > MAX_UPLOAD_BYTES) throw new Error("stdin is over the 30 MB limit");
     chunks.push(chunk);
   }
   if (!size) throw new Error("nothing on stdin");
   return { "index.html": Buffer.concat(chunks) };
 }
 
-async function collectFile(abs: string, files: Record<string, Uint8Array>, budget: Budget) {
+async function collectFile(abs: string, files: Record<string, Uint8Array>) {
   const real = await realpath(abs);
   const root = path.dirname(real);
   const main = path.basename(real);
-  const html = await readRegular(real, root, budget);
+  const html = await readRegular(real, root);
   if (!html) throw new Error(`can't read ${abs}`);
   files["index.html"] = html;
   const tried = new Set(["index.html", main]);
@@ -637,7 +622,7 @@ async function collectFile(abs: string, files: Record<string, Uint8Array>, budge
         if (Object.hasOwn(files, candidate) || candidate === main) break;
         if (tried.has(candidate) || candidate.startsWith("../") || candidate.split("/").some((seg) => seg.startsWith("."))) continue;
         tried.add(candidate);
-        const data = await readRegular(path.join(root, ...candidate.split("/")), root, budget);
+        const data = await readRegular(path.join(root, ...candidate.split("/")), root);
         if (!data) continue;
         files[candidate] = data;
         queue.push([candidate, data]);
