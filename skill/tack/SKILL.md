@@ -1,11 +1,11 @@
 ---
 name: tack
-description: Use when the user wants an HTML write-up (plan, spec, report, findings, comparison, UI mock) published as a shareable link, or gives you a tack.rex.wf URL to read.
+description: Use when the user wants an HTML write-up (plan, spec, report, findings, comparison, UI mock) published as a shareable link, or gives you a tack.squeakyfiddlepro.me URL to read.
 ---
 
 # tack
 
-`tack` publishes HTML to the user's private site (https://tack.rex.wf) and returns a secret link. Every doc is versioned: uploading to the same slug adds a new version under the same link.
+`tack` publishes HTML to the user's private site (https://tack.squeakyfiddlepro.me) and returns a secret link. Every doc is versioned: uploading to the same slug adds a new version under the same link.
 
 ## Publish a new doc
 
@@ -18,7 +18,7 @@ description: Use when the user wants an HTML write-up (plan, spec, report, findi
 
 ## Sensitive docs
 
-If the doc contains anything sensitive (credentials, personal data, unreleased plans the user wouldn't want leaked), add `--private`: it's served at `private.tack.rex.wf/<id>` and only opens in the user's own browsers. Don't use it for docs meant to be shared with other people. Updates keep the doc private without the flag; only `--public` makes it public again, and only do that if the user asks.
+If the doc contains anything sensitive (credentials, personal data, unreleased plans the user wouldn't want leaked), add `--private`: when Cloudflare Access is configured, it's served at `private.tack.squeakyfiddlepro.me/<id>` and only opens in the user's own browsers. Don't use it for docs meant to be shared with other people. Updates keep the doc private without the flag; only `--public` makes it public again, and only do that if the user asks. If private docs are not enabled on this instance, stop and tell the user rather than publishing sensitive content publicly.
 
 ## Update a doc
 
@@ -40,4 +40,4 @@ To see what changed between versions, fetch the doc's `url` with `/_diff?a=<n>&b
 
 `tack list [--match <words>] [--json]`, `tack rm <slug> [--v <n>]`, `tack mv <slug> <new-slug>`, `tack help`. Don't run `tack open`; it's for the user.
 
-Never put the tack token, the config file, or the `tack open` link in a doc or a chat reply. If tack reports a bad or missing token, ask the user to run `tack setup --token` and paste the token when asked (it's in `~/.config/tack/config.json` on a machine where tack already works). Never ask for the token in chat. If `tack` isn't installed, ask the user to install it (`curl -fsSL https://tack.rex.wf/install | sh`) rather than writing your own uploader.
+Never put the tack token, the config file, or the `tack open` link in a doc or a chat reply. If tack reports a bad or missing token, ask the user to run `tack setup --token` and paste the token when asked (it's in `~/.config/tack/config.json` on a machine where tack already works). Never ask for the token in chat. If `tack` isn't installed, ask the user to install it (`curl -fsSL https://tack.squeakyfiddlepro.me/install | sh`) rather than writing your own uploader.

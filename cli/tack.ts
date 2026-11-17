@@ -8,7 +8,7 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { parseArgs } from "node:util";
 
-const DEFAULT_URL = "https://tack.rex.wf";
+const DEFAULT_URL = "https://tack.squeakyfiddlepro.me";
 const CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config"), "tack");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 const MAX_UPLOAD_BYTES = 30 * 1024 * 1024;

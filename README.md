@@ -11,7 +11,7 @@ An agent runs `tack upload plan.html` and replies with a link. Uploading again a
 ## Setup
 
 1. Create an R2 bucket named `tack`.
-2. Workers & Pages → Import this repo. Deploy command `bunx wrangler deploy`, build variable `BUN_VERSION=1.4.0`. If you fork it, put your domains in `wrangler.jsonc` (`routes` and `vars`: docs and the doc list each on their own host), `DEFAULT_URL` in `cli/tack.ts` and `base` in `cli/install.sh`.
+2. Workers & Pages → Import this repo. Deploy command `bunx wrangler deploy`, build variable `BUN_VERSION=1.4.0`. This instance uses `tack.squeakyfiddlepro.me` for docs, `list.tack.squeakyfiddlepro.me` for the doc list, and `private.tack.squeakyfiddlepro.me` for optional private docs.
 3. Install the CLI and skill (running from the repo needs Node 22.18+):
 
 ```sh
@@ -20,15 +20,15 @@ mkdir -p ~/.local/bin ~/.agents/skills
 ln -s "$PWD/cli/tack.ts" ~/.local/bin/tack
 ln -s "$PWD/skill/tack" ~/.agents/skills/tack
 tack setup   # creates a token and sets it on the Worker
-tack open    # unlocks the doc list (list.tack.rex.wf) in your browser
+tack open    # unlocks the doc list (list.tack.squeakyfiddlepro.me) in your browser
 ```
 
-4. Optional, for private docs: in Zero Trust → Access → Applications, add a self-hosted application for the private host (`private.tack.rex.wf`; not "Protect this Worker", which breaks WebSockets) with a policy that allows only your email. Put your team domain (`https://<team>.cloudflareaccess.com`) and the application's AUD tag in `wrangler.jsonc` as `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`. Without all three of `PRIVATE_HOST`, `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`, private docs are off.
+4. Optional, for private docs: in Zero Trust → Access → Applications, add a self-hosted application for `private.tack.squeakyfiddlepro.me` (not "Protect this Worker", which breaks WebSockets) with a policy that allows only your email. Put your team domain (`https://<team>.cloudflareaccess.com`) and the application's AUD tag in `wrangler.jsonc` as `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`. Private docs stay disabled until all three of `PRIVATE_HOST`, `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` are set.
 
 Any other machine with Node 20+ installs the CLI and skill from your instance:
 
 ```sh
-curl -fsSL https://tack.rex.wf/install | sh
+curl -fsSL https://tack.squeakyfiddlepro.me/install | sh
 tack setup --token   # paste the token from ~/.config/tack/config.json on the first machine
 ```
 

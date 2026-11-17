@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-base="${TACK_URL:-https://tack.rex.wf}"
+base="${TACK_URL:-https://tack.squeakyfiddlepro.me}"
 case "$base" in
   https://*) fetch() { curl -fsSL --proto =https --proto-redir =https "$@"; } ;;
   *) fetch() { curl -fsSL "$@"; } ;;
