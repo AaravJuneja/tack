@@ -8,13 +8,11 @@
   "preview_urls": false,
   "routes": [
     { "pattern": "tack.squeakyfiddlepro.me", "custom_domain": true },
-    { "pattern": "list.tack.squeakyfiddlepro.me", "custom_domain": true },
-    { "pattern": "private.tack.squeakyfiddlepro.me", "custom_domain": true }
+    { "pattern": "list.tack.squeakyfiddlepro.me", "custom_domain": true }
   ],
   "vars": {
     "DOCS_HOST": "tack.squeakyfiddlepro.me",
-    "LIST_HOST": "list.tack.squeakyfiddlepro.me",
-    "PRIVATE_HOST": "private.tack.squeakyfiddlepro.me"
+    "LIST_HOST": "list.tack.squeakyfiddlepro.me"
   },
 
   "build": { "command": "bun run build" },

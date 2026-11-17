@@ -18,7 +18,7 @@ description: Use when the user wants an HTML write-up (plan, spec, report, findi
 
 ## Sensitive docs
 
-If the doc contains anything sensitive (credentials, personal data, unreleased plans the user wouldn't want leaked), add `--private`: when Cloudflare Access is configured, it's served at `private.tack.squeakyfiddlepro.me/<id>` and only opens in the user's own browsers. Don't use it for docs meant to be shared with other people. Updates keep the doc private without the flag; only `--public` makes it public again, and only do that if the user asks. If private docs are not enabled on this instance, stop and tell the user rather than publishing sensitive content publicly.
+Private docs (`--private`) are turned off on this instance, and every doc is readable by anyone with its link. If the doc would contain anything sensitive (credentials, personal data, unreleased plans the user wouldn't want leaked), don't publish it: tell the user and leave that content out or ask how to proceed.
 
 ## Update a doc
 
