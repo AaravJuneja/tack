@@ -11,7 +11,7 @@ An agent runs `tack upload plan.html` and replies with a link. Uploading again a
 ## Setup
 
 1. Create an R2 bucket named `tack`.
-2. Workers & Pages → Import this repo. Deploy command `bunx wrangler deploy`, build variable `BUN_VERSION=1.4.0`. This instance uses `tack.squeakyfiddlepro.me` for docs, `list.tack.squeakyfiddlepro.me` for the doc list, and `private.tack.squeakyfiddlepro.me` for optional private docs.
+2. Workers & Pages → Import this repo. Deploy command `bunx wrangler deploy`, build variable `BUN_VERSION=1.4.4`. This instance uses `tack.squeakyfiddlepro.me` for docs, `list.tack.squeakyfiddlepro.me` for the doc list, and `private.tack.squeakyfiddlepro.me` for optional private docs.
 3. Install the CLI and skill (running from the repo needs Node 22.18+):
 
 ```sh

@@ -14,8 +14,8 @@
     "build": "rm -rf dist && mkdir dist && bun build cli/tack.ts --target=node --outfile=dist/cli && cp skill/tack/SKILL.md dist/skill.md && cp cli/install.sh dist/install && cp public/* dist/ && test \"$(ls -A dist | tr '\\n' ' ')\" = 'apple-touch-icon.png cli favicon.ico favicon.svg install skill.md '"
   },
   "devDependencies": {
-    "@types/node": "^26.6.4",
+    "@types/node": "^26.6.6",
     "typescript": "^7.0.2",
-    "wrangler": "^4.148.0"
+    "wrangler": "^4.163.0"
   }
 }
