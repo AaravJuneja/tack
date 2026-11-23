@@ -10,7 +10,7 @@ An agent runs `tack upload plan.html` and replies with a link. Uploading again a
 
 ## Setup
 
-1. In Cloudflare Workers & Pages, import this repo on Workers Free. Set the deploy command to `bunx wrangler deploy` and the build variable `BUN_VERSION=1.4.4`. The deploy creates the Durable Object classes. If you use your own domain, set three distinct hostnames in both `routes` and `vars` in `wrangler.jsonc`.
+1. In Cloudflare Workers & Pages, import this repo on Workers Free. Set the deploy command to `bunx wrangler deploy` and the build variable `BUN_VERSION=1.4.5`. The deploy creates the Durable Object classes. If you use your own domain, set three distinct hostnames in both `routes` and `vars` in `wrangler.jsonc`.
 
 2. Install the CLI and skill (running from the repo needs Node 22.18+):
 
