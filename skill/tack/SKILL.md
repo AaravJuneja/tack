@@ -18,7 +18,7 @@ description: Use when the user wants an HTML write-up (plan, spec, report, findi
 
 ## Sensitive docs
 
-Private docs (`--private`) are turned off on this instance, and every doc is readable by anyone with its link. If the doc would contain anything sensitive (credentials, personal data, unreleased plans the user wouldn't want leaked), don't publish it: tell the user and leave that content out or ask how to proceed.
+Ordinary links are readable by anyone with the link. Use `--private` when the user asks to restrict a doc to their authenticated browser. Tell them to run `tack open --private` themselves to unlock the browser. Never publish credentials. If you aren't sure whether the user wants sensitive material published at all, leave it out or ask how to proceed.
 
 ## Update a doc
 
@@ -32,9 +32,9 @@ The `url` stays the same and always shows the latest version. `versionUrl` pins 
 
 ## Read a doc
 
-Links open without a login, so any fetch tool works. `tack get <url-or-slug>` prints the exact HTML (`--v <n>` for a specific version) and `# <slug> v<n> of <latest>` to stderr.
+Ordinary links open without a login. For private docs, use `tack get <url-or-slug>` with a configured Tack token. It prints the exact HTML (`--v <n>` for a specific version) and `# <slug> v<n> of <latest>` to stderr.
 
-To see what changed between versions, fetch the doc's `url` with `/_diff?a=<n>&b=<m>` appended.
+To see what changed between versions, open the doc's `url` with `/_diff?a=<n>&b=<m>` appended. Private diffs require an unlocked browser.
 
 ## Other commands
 

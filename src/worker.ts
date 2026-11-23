@@ -1,12 +1,17 @@
 import { DurableObject } from "cloudflare:workers";
+import { Blobs, MAX_BLOB_BYTES } from "./blobs";
+
+export { Blobs };
 
 interface Env {
   LIVE: DurableObjectNamespace<Live>;
   STORE: DurableObjectNamespace<Store>;
+  BLOBS: DurableObjectNamespace<Blobs>;
   TACK_TOKEN?: string;
   DOCS_HOST?: string;
   LIST_HOST?: string;
   PRIVATE_HOST?: string;
+  PRIVATE_AUTH?: string;
   ACCESS_TEAM_DOMAIN?: string;
   ACCESS_AUD?: string;
 }
@@ -24,14 +29,13 @@ type Version = {
 type Files = Record<string, string>;
 type Meta = {
   slug: string;
+  id: string;
   title: string;
   createdAt: string;
   updatedAt: string;
   lastN?: number;
   rev?: number;
   gen?: number;
-  lock?: { reason: string; at: number; to?: string; from?: string; phase?: "cleanup" };
-  renamedFrom?: { slug: string; gen: number };
   private?: boolean;
   versions: Version[];
 };
@@ -56,21 +60,21 @@ type LiveState = {
 };
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
-const BLOB_CHUNK_BYTES = 4 * 1024 * 1024;
 const RESERVED_SLUGS = new Set(["api", "login", "cli", "install"]);
 const RESERVED_PATHS = new Set(["v", "_history", "_diff", "_live"]);
 const HASH_RE = /^[0-9a-f]{64}$/;
-const LOCK_MS = 5 * 60_000;
 const INLINE_FILES = 8;
+const PRIVATE_SESSION_SECONDS = 7 * 24 * 60 * 60;
+const PRIVATE_COOKIE = "__Host-tack-private";
 const fileCount = (v: Version) => v.count ?? Object.keys(v.files ?? {}).length;
-const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const newer = (a: LiveState, b: LiveState) => (a.gen ?? 0) - (b.gen ?? 0) || a.rev - b.rev;
 const liveState = (meta: Meta): LiveState => {
   const ns = meta.versions.map((v) => v.n);
   return { gen: meta.gen ?? 0, rev: meta.rev ?? 0, ns, latest: ns.at(-1), count: ns.length };
 };
 type StoredMeta = { meta: Meta; etag: string };
-type MetaCondition = { etagMatches?: string; createOnly?: boolean };
+type DocRow = { id: string; deleting: number };
+type RemoveResult = { status: "missing" } | { status: "busy" } | { status: "removed"; meta: string | null };
 
 function bye(ws: WebSocket) {
   try {
@@ -135,77 +139,72 @@ export class Live extends DurableObject<Env> {
 
 export class Store extends DurableObject<Env> {
   sql = this.ctx.storage.sql;
+  private activePuts = new Map<string, number>();
+  private activeDeletes = new Set<string>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS docs (
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS documents (
       slug TEXT PRIMARY KEY,
-      meta TEXT NOT NULL,
-      etag TEXT NOT NULL,
-      title TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      latest INTEGER NOT NULL,
-      versions INTEGER NOT NULL,
-      is_private INTEGER NOT NULL
-    )`);
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS blobs (
-      slug TEXT NOT NULL,
-      hash TEXT NOT NULL,
-      size INTEGER NOT NULL,
-      PRIMARY KEY (slug, hash)
-    )`);
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS blob_chunks (
-      slug TEXT NOT NULL,
-      hash TEXT NOT NULL,
-      part INTEGER NOT NULL,
-      data BLOB NOT NULL,
-      PRIMARY KEY (slug, hash, part)
+      id TEXT NOT NULL UNIQUE,
+      meta TEXT,
+      etag TEXT,
+      title TEXT,
+      updated_at TEXT,
+      latest INTEGER,
+      versions INTEGER,
+      is_private INTEGER,
+      deleting INTEGER NOT NULL DEFAULT 0
     )`);
   }
 
   getMeta(slug: string): string | null {
-    const row = this.sql.exec<{ meta: string; etag: string }>("SELECT meta, etag FROM docs WHERE slug = ?", slug).toArray()[0];
+    const row = this.sql.exec<{ meta: string; etag: string }>(
+      "SELECT meta, etag FROM documents WHERE slug = ? AND meta IS NOT NULL AND deleting = 0", slug,
+    ).toArray()[0];
     return row ? JSON.stringify({ meta: JSON.parse(row.meta), etag: row.etag }) : null;
   }
 
-  saveMeta(json: string, etagMatches: string | null, createOnly: boolean): string | null {
+  saveMeta(json: string, expected: string | null): boolean {
     const meta = JSON.parse(json) as Meta;
-    return this.ctx.storage.transactionSync(() => {
-      const current = this.sql.exec<{ etag: string }>("SELECT etag FROM docs WHERE slug = ?", meta.slug).toArray()[0];
-      if (createOnly ? current : etagMatches !== null && current?.etag !== etagMatches) return null;
-      const etag = crypto.randomUUID();
-      this.sql.exec(
-        `INSERT INTO docs (slug, meta, etag, title, updated_at, latest, versions, is_private)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(slug) DO UPDATE SET meta = excluded.meta, etag = excluded.etag,
-           title = excluded.title, updated_at = excluded.updated_at, latest = excluded.latest,
-           versions = excluded.versions, is_private = excluded.is_private`,
-        meta.slug,
-        json,
-        etag,
-        meta.title,
-        meta.updatedAt,
-        meta.versions.at(-1)?.n ?? 0,
-        meta.versions.length,
-        Number(Boolean(meta.private)),
-      );
-      return etag;
-    });
+    return this.sql.exec(
+      `UPDATE documents SET meta = ?, etag = ?, title = ?, updated_at = ?, latest = ?, versions = ?, is_private = ?
+       WHERE slug = ? AND id = ? AND etag IS ? AND deleting = 0`,
+      json, crypto.randomUUID(), meta.title, meta.updatedAt, meta.versions.at(-1)!.n,
+      meta.versions.length, Number(Boolean(meta.private)), meta.slug, meta.id, expected,
+    ).rowsWritten > 0;
   }
 
-  deleteMeta(slug: string, etag: string): boolean {
-    return this.ctx.storage.transactionSync(() => {
-      const current = this.sql.exec<{ etag: string }>("SELECT etag FROM docs WHERE slug = ?", slug).toArray()[0];
-      if (current?.etag !== etag) return false;
-      this.sql.exec("DELETE FROM docs WHERE slug = ?", slug);
-      return true;
-    });
+  moveDoc(from: string, json: string, expected: string): boolean {
+    const meta = JSON.parse(json) as Meta;
+    return this.sql.exec(
+      `UPDATE documents SET slug = ?, meta = ?, etag = ?
+       WHERE slug = ? AND id = ? AND etag = ? AND deleting = 0
+         AND NOT EXISTS (SELECT 1 FROM documents WHERE slug = ?)`,
+      meta.slug, json, crypto.randomUUID(), from, meta.id, expected, meta.slug,
+    ).rowsWritten > 0;
+  }
+
+  async removeDoc(slug: string): Promise<RemoveResult> {
+    const doc = this.sql.exec<{ id: string; meta: string | null }>("SELECT id, meta FROM documents WHERE slug = ?", slug).toArray()[0];
+    if (!doc) return { status: "missing" };
+    const { id, meta } = doc;
+    if (this.activePuts.has(id) || this.activeDeletes.has(id)) return { status: "busy" };
+    this.sql.exec("UPDATE documents SET deleting = 1 WHERE id = ?", id);
+    this.activeDeletes.add(id);
+    try {
+      await blobs(this.env, id).erase();
+      this.sql.exec("DELETE FROM documents WHERE id = ?", id);
+      return { status: "removed", meta };
+    } finally {
+      this.activeDeletes.delete(id);
+    }
   }
 
   listDocs(): string {
     const rows = this.sql
       .exec<{ slug: string; title: string; updated_at: string; latest: number; versions: number; is_private: number }>(
-        "SELECT slug, title, updated_at, latest, versions, is_private FROM docs ORDER BY updated_at DESC, slug",
+        "SELECT slug, title, updated_at, latest, versions, is_private FROM documents WHERE meta IS NOT NULL AND deleting = 0 ORDER BY updated_at DESC, slug",
       )
       .toArray();
     return JSON.stringify(
@@ -220,148 +219,36 @@ export class Store extends DurableObject<Env> {
     );
   }
 
-  hasBlobs(slug: string, hashes: string[]): string[] {
-    const found: string[] = [];
-    for (const batch of batches(hashes)) {
-      const rows = this.sql.exec<{ hash: string }>(`SELECT hash FROM blobs WHERE slug = ? AND hash IN (${marks(batch)})`, slug, ...batch);
-      for (const row of rows) found.push(row.hash);
+  async putBlob(slug: string, hash: string, body: ReadableStream<Uint8Array> | null, length: number, expected?: string) {
+    const doc = this.document(slug);
+    if (doc?.deleting || (expected && doc?.id !== expected)) {
+      await body?.cancel();
+      return "changed";
     }
-    return found;
-  }
-
-  async putBlob(slug: string, hash: string, body: ReadableStream<Uint8Array> | ArrayBuffer | null): Promise<boolean> {
-    if (this.blobSize(slug, hash) !== null) {
-      if (body instanceof ReadableStream) await body.cancel();
-      return true;
-    }
-    const temp = `${hash}.${crypto.randomUUID()}`;
-    const digest = new crypto.DigestStream("SHA-256");
-    const writer = digest.getWriter();
-    const buf = new Uint8Array(BLOB_CHUNK_BYTES);
-    let fill = 0;
-    let part = 0;
-    let size = 0;
-    const flush = () => {
-      if (!fill) return;
-      this.sql.exec("INSERT INTO blob_chunks (slug, hash, part, data) VALUES (?, ?, ?, ?)", slug, temp, part++, buf.slice(0, fill).buffer);
-      fill = 0;
-    };
-    const add = async (chunk: Uint8Array) => {
-      await writer.write(chunk);
-      size += chunk.byteLength;
-      for (let at = 0; at < chunk.byteLength; ) {
-        const n = Math.min(chunk.byteLength - at, BLOB_CHUNK_BYTES - fill);
-        buf.set(chunk.subarray(at, at + n), fill);
-        fill += n;
-        at += n;
-        if (fill === BLOB_CHUNK_BYTES) flush();
-      }
-    };
+    const id = doc?.id ?? crypto.randomUUID();
+    if (!doc) this.sql.exec("INSERT INTO documents (slug, id) VALUES (?, ?)", slug, id);
+    this.activePuts.set(id, (this.activePuts.get(id) ?? 0) + 1);
     try {
-      if (body instanceof ReadableStream) for await (const chunk of body) await add(chunk);
-      else if (body) await add(new Uint8Array(body));
-      flush();
-      await writer.close();
-      if (hex(await digest.digest) !== hash) {
-        this.sql.exec("DELETE FROM blob_chunks WHERE slug = ? AND hash = ?", slug, temp);
-        return false;
-      }
-    } catch (err) {
-      this.sql.exec("DELETE FROM blob_chunks WHERE slug = ? AND hash = ?", slug, temp);
-      throw err;
+      return await blobs(this.env, id).put(id, hash, body, length);
+    } finally {
+      const left = this.activePuts.get(id)! - 1;
+      if (left) this.activePuts.set(id, left);
+      else this.activePuts.delete(id);
     }
-    this.ctx.storage.transactionSync(() => {
-      if (this.blobSize(slug, hash) !== null) {
-        this.sql.exec("DELETE FROM blob_chunks WHERE slug = ? AND hash = ?", slug, temp);
-        return;
-      }
-      this.sql.exec("UPDATE blob_chunks SET hash = ? WHERE slug = ? AND hash = ?", hash, slug, temp);
-      this.sql.exec("INSERT INTO blobs (slug, hash, size) VALUES (?, ?, ?)", slug, hash, size);
-    });
-    return true;
   }
 
-  getBlob(slug: string, hash: string, limit = Number.MAX_SAFE_INTEGER): ReadableStream<Uint8Array> | null {
-    if (this.blobSize(slug, hash) === null) return null;
-    let part = 0;
-    let left = limit;
-    return new ReadableStream({
-      type: "bytes",
-      pull: (controller) => {
-        const row =
-          left > 0
-            ? this.sql
-                .exec<{ data: ArrayBuffer }>("SELECT data FROM blob_chunks WHERE slug = ? AND hash = ? AND part = ?", slug, hash, part++)
-                .toArray()[0]
-            : undefined;
-        if (!row) return controller.close();
-        const bytes = new Uint8Array(row.data, 0, Math.min(row.data.byteLength, left));
-        left -= bytes.byteLength;
-        controller.enqueue(bytes);
-      },
-    });
+  document(slug: string): DocRow | null {
+    return this.sql.exec<DocRow>("SELECT id, deleting FROM documents WHERE slug = ?", slug).toArray()[0] ?? null;
   }
 
-  deleteBlobs(slug: string) {
-    this.ctx.storage.transactionSync(() => {
-      this.sql.exec("DELETE FROM blob_chunks WHERE slug = ?", slug);
-      this.sql.exec("DELETE FROM blobs WHERE slug = ?", slug);
-    });
-  }
-
-  copyBlobs(from: string, to: string, versionsJson: string): boolean {
-    const versions = JSON.parse(versionsJson) as Version[];
-    const hashes = new Set<string>();
-    for (const v of versions) {
-      if (v.files) for (const h of Object.values(v.files)) hashes.add(h);
-      if (!v.manifest) continue;
-      hashes.add(v.manifest);
-      const text = this.readText(from, v.manifest);
-      if (text === null) return false;
-      for (const h of Object.values(JSON.parse(text) as Files)) hashes.add(h);
-    }
-    const list = [...hashes];
-    return this.ctx.storage.transactionSync(() => {
-      let found = 0;
-      for (const batch of batches(list)) {
-        found += this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM blobs WHERE slug = ? AND hash IN (${marks(batch)})`, from, ...batch).one().n;
-      }
-      if (found !== list.length) return false;
-      this.sql.exec("DELETE FROM blob_chunks WHERE slug = ?", to);
-      this.sql.exec("DELETE FROM blobs WHERE slug = ?", to);
-      for (const batch of batches(list)) {
-        this.sql.exec(`INSERT INTO blobs (slug, hash, size) SELECT ?, hash, size FROM blobs WHERE slug = ? AND hash IN (${marks(batch)})`, to, from, ...batch);
-        this.sql.exec(
-          `INSERT INTO blob_chunks (slug, hash, part, data) SELECT ?, hash, part, data FROM blob_chunks WHERE slug = ? AND hash IN (${marks(batch)})`,
-          to,
-          from,
-          ...batch,
-        );
-      }
-      return true;
-    });
-  }
-
-  private blobSize(slug: string, hash: string): number | null {
-    return this.sql.exec<{ size: number }>("SELECT size FROM blobs WHERE slug = ? AND hash = ?", slug, hash).toArray()[0]?.size ?? null;
-  }
-
-  private readText(slug: string, hash: string): string | null {
-    if (this.blobSize(slug, hash) === null) return null;
-    const rows = this.sql.exec<{ data: ArrayBuffer }>("SELECT data FROM blob_chunks WHERE slug = ? AND hash = ? ORDER BY part", slug, hash);
-    const decoder = new TextDecoder();
-    let text = "";
-    for (const row of rows) text += decoder.decode(row.data, { stream: true });
-    return text + decoder.decode();
+  canWriteBlobs(id: string): boolean {
+    return this.sql.exec("SELECT 1 FROM documents WHERE id = ? AND deleting = 0", id).toArray().length !== 0;
   }
 }
 
-const batches = (items: string[], size = 90) => Array.from({ length: Math.ceil(items.length / size) }, (_, i) => items.slice(i * size, (i + 1) * size));
-const marks = (items: string[]) => items.map(() => "?").join(",");
-const hex = (buf: ArrayBuffer) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
-
 const live = (env: Env, slug: string) => env.LIVE.get(env.LIVE.idFromName(slug));
-const store = (env: Env) => env.STORE.get(env.STORE.idFromName("tack"));
+const store = (env: Env) => env.STORE.get(env.STORE.idFromName("catalog"));
+const blobs = (env: Env, id: string) => env.BLOBS.get(env.BLOBS.idFromName(id));
 const LIST_LIVE = "__list__";
 
 async function storedMeta(env: Env, slug: string): Promise<StoredMeta | null> {
@@ -401,7 +288,7 @@ export default {
       console.error(err);
       const message = err instanceof Error ? err.message : String(err);
       if (/SQLITE_FULL|database or disk is full|exceeded.*storage/i.test(message)) res = fail(507, "Cloudflare storage is full");
-      else if (/SQLITE_TOOBIG|too big/i.test(message)) res = fail(413, "too big for Cloudflare's SQLite row limit");
+      else if (/SQLITE_TOOBIG/i.test(message)) res = fail(413, "too big for Cloudflare's SQLite row limit");
       else res = text(`tack: internal error: ${message}`, 500);
     }
     const out = new Response(res.body, res);
@@ -414,7 +301,10 @@ export default {
 async function route(req: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
   if (url.pathname === "/robots.txt") return text("User-agent: *\nDisallow: /\n");
   if (env.LIST_HOST && url.host === env.LIST_HOST) return listSite(req, env, url);
-  if (env.PRIVATE_HOST && url.host === env.PRIVATE_HOST) return privateOn(env) ? privateSite(req, env, ctx, url) : notFound();
+  if (env.PRIVATE_HOST && url.host === env.PRIVATE_HOST) {
+    const auth = privateMode(env);
+    return auth ? privateSite(req, env, ctx, url, auth) : notFound();
+  }
   if (url.pathname === "/") {
     if (!env.LIST_HOST) return notFound();
     return new Response(null, {
@@ -461,22 +351,72 @@ function isolate(res: Response, frames: "'none'" | "'self'"): Response {
   return res;
 }
 
-async function privateSite(req: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
+async function privateSite(req: Request, env: Env, ctx: ExecutionContext, url: URL, auth: "token" | "access"): Promise<Response> {
   const site = req.headers.get("sec-fetch-site");
   const mode = req.headers.get("sec-fetch-mode");
-  if (site && site !== "same-origin" && site !== "none" && mode !== "navigate") return fail(403, "forbidden");
-  if (url.pathname === "/") return redirect(`${url.protocol}//${env.LIST_HOST}/`);
-  if (!(await isOwner(req, env))) {
-    return isolate(html(page("tack", `<h1>📌 tack</h1><p class="m">Private docs need a Cloudflare Access sign-in.</p>`), 403), "'none'");
+  const socket = url.pathname.endsWith("/_live");
+  if ((site && site !== "same-origin" && site !== "none" && mode !== "navigate") ||
+      (socket && req.headers.get("origin") !== url.origin)) {
+    return isolate(fail(403, "forbidden"), "'none'");
   }
-  if (url.pathname.endsWith("/_live") && req.headers.get("origin") !== `${url.protocol}//${env.PRIVATE_HOST}`) {
-    return fail(403, "forbidden");
+  if (auth === "token" && url.pathname === "/login") {
+    const res = req.method === "POST" ? await privateLogin(req, env.TACK_TOKEN!, url) : loginPage(true);
+    return isolate(res, "'none'");
+  }
+  if (!(await (auth === "token" ? hasPrivateSession(req, env.TACK_TOKEN!) : isAccessOwner(req, env)))) {
+    const help = auth === "token"
+      ? "Run <code>tack open --private</code> to unlock private docs, then reload this page."
+      : "Private docs need a Cloudflare Access sign-in.";
+    return isolate(html(page("tack", `<h1>📌 tack</h1><p class="m">${help}</p>`), 403), "'none'");
+  }
+  if (url.pathname === "/") {
+    if (auth === "access" && env.LIST_HOST) return isolate(redirect(`${url.protocol}//${env.LIST_HOST}/`), "'none'");
+    const link = env.LIST_HOST ? `<p class="m"><a href="${esc(`${url.protocol}//${env.LIST_HOST}/`)}">Go to the doc list</a></p>` : "";
+    return isolate(html(page("tack", `<h1>📌 tack</h1><p>Private docs unlocked in this browser.</p>${link}`)), "'none'");
   }
   const res = await serveDoc(req, env, ctx, url, "private");
   return res.webSocket ? res : isolate(res, "'self'");
 }
 
-const privateOn = (env: Env) => Boolean(env.PRIVATE_HOST && env.ACCESS_TEAM_DOMAIN && env.ACCESS_AUD);
+function privateMode(env: Env): "token" | "access" | null {
+  if (!env.PRIVATE_HOST || env.PRIVATE_HOST === env.DOCS_HOST || env.PRIVATE_HOST === env.LIST_HOST) return null;
+  if (env.PRIVATE_AUTH === "token") return env.TACK_TOKEN ? "token" : null;
+  return !env.PRIVATE_AUTH && env.ACCESS_TEAM_DOMAIN && env.ACCESS_AUD ? "access" : null;
+}
+
+async function checkPrivateGrant(token: string, grant: string, purpose: "unlock" | "session", maxAge: number): Promise<boolean> {
+  const match = grant.match(/^(\d{1,12})\.([a-f0-9]{64})$/);
+  if (!match) return false;
+  const [, exp, sig] = match;
+  const now = Math.floor(Date.now() / 1000);
+  if (Number(exp) <= now || Number(exp) > now + maxAge) return false;
+  return same(sig, await hmac(token, `${purpose}:private:${exp}`));
+}
+
+async function hasPrivateSession(req: Request, token: string): Promise<boolean> {
+  const cookies = (req.headers.get("cookie") ?? "").split(/;\s*/);
+  const prefix = `${PRIVATE_COOKIE}=`;
+  for (const value of cookies) {
+    if (value.startsWith(prefix) && await checkPrivateGrant(token, value.slice(prefix.length), "session", PRIVATE_SESSION_SECONDS)) return true;
+  }
+  return false;
+}
+
+async function privateLogin(req: Request, token: string, url: URL): Promise<Response> {
+  const code = req.headers.get("authorization")?.match(/^Bearer (.+)$/i)?.[1] ?? "";
+  if (req.headers.get("origin") !== url.origin || !(await checkPrivateGrant(token, code, "unlock", 660))) {
+    return text("that private unlock link didn't work or has expired", 403);
+  }
+  const exp = Math.floor(Date.now() / 1000) + PRIVATE_SESSION_SECONDS;
+  const value = `${exp}.${await hmac(token, `session:private:${exp}`)}`;
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "cache-control": "no-store, no-transform",
+      "set-cookie": `${PRIVATE_COOKIE}=${value}; Max-Age=${PRIVATE_SESSION_SECONDS}; Path=/; HttpOnly; Secure; SameSite=Lax`,
+    },
+  });
+}
 
 let accessKeys: Map<string, CryptoKey> | undefined;
 let accessTried = 0;
@@ -506,7 +446,7 @@ async function accessKey(env: Env, kid: string): Promise<CryptoKey | undefined> 
 
 const unb64url = (s: string) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
 
-async function isOwner(req: Request, env: Env): Promise<boolean> {
+async function isAccessOwner(req: Request, env: Env): Promise<boolean> {
   const [head, body, sig, extra] = req.headers.get("cf-access-jwt-assertion")?.split(".") ?? [];
   if (!sig || extra !== undefined) return false;
   try {
@@ -577,10 +517,12 @@ async function same(given: string | null | undefined, expected: string): Promise
 
 async function api(req: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
   if (url.pathname === "/api/info") {
+    const auth = privateMode(env);
     return json({
       ok: true,
       listUrl: env.LIST_HOST ? `${url.protocol}//${env.LIST_HOST}` : null,
-      privateUrl: privateOn(env) ? `${url.protocol}//${env.PRIVATE_HOST}` : null,
+      privateUrl: auth ? `${url.protocol}//${env.PRIVATE_HOST}` : null,
+      privateUnlock: auth === "token",
     });
   }
   const raw = url.pathname.match(/^\/api\/raw\/([^/]+)(\/.*)?$/);
@@ -615,26 +557,15 @@ async function api(req: Request, env: Env, ctx: ExecutionContext, url: URL): Pro
   return fail(405, "method not allowed");
 }
 
-async function blocked(env: Env, meta: Meta): Promise<string | null> {
-  const lock = meta.lock;
-  if (!lock) return null;
-  if (Date.now() - lock.at < LOCK_MS) return `${meta.slug} is ${lock.reason}; retry in a moment`;
-  const finish = (slug: string, what: string) => `an earlier ${what} didn't finish; run \`tack rm ${slug}\` to clean it up`;
-  if (lock.from) return finish(meta.slug, `rename from ${lock.from}`);
-  if (!lock.to) return finish(meta.slug, "delete");
-  if (lock.phase === "cleanup") return finish(meta.slug, `rename to ${lock.to}`);
-  const target = await getMeta(env, lock.to);
-  if (target?.lock?.from === meta.slug) return finish(lock.to, `rename to ${lock.to}`);
-  if (target?.renamedFrom?.slug === meta.slug && target.renamedFrom.gen === (meta.gen ?? 0)) {
-    return finish(meta.slug, `rename to ${lock.to}`);
-  }
-  return null;
-}
-
 async function putBlob(req: Request, env: Env, slug: string, hash: string): Promise<Response> {
-  if (!SLUG_RE.test(slug)) return fail(400, "bad slug");
+  if (!SLUG_RE.test(slug) || RESERVED_SLUGS.has(slug)) return fail(400, "bad slug");
+  const length = Number(req.headers.get("content-length") ?? (req.body ? NaN : 0));
+  if (!Number.isSafeInteger(length) || length < 0) return fail(411, "a blob upload needs Content-Length");
+  if (length > MAX_BLOB_BYTES) return fail(413, "file exceeds the 100 MB upload limit");
   try {
-    if (!(await store(env).putBlob(slug, hash, req.body))) return fail(400, "file contents don't match their hash");
+    const result = await store(env).putBlob(slug, hash, req.body, length);
+    if (result === "mismatch") return fail(400, "file contents don't match their length or hash");
+    if (result === "changed") return fail(409, `${slug} is being deleted; finish with tack rm ${slug}`);
   } catch (err) {
     if ((err as { retryable?: boolean }).retryable || /overloaded/i.test(String(err))) return fail(503, "storage busy; retry");
     throw err;
@@ -662,63 +593,68 @@ async function upload(req: Request, env: Env, url: URL, slug: string): Promise<R
   if (!Object.hasOwn(files, "index.html")) return fail(400, "an upload needs an index.html");
   const size = Math.max(0, Math.floor(Number(body.size) || 0));
 
-  const versionHash = await sha256(
-    new TextEncoder().encode(Object.keys(files).sort().map((p) => `${p}\0${files[p]}`).join("\n")),
-  );
+  const paths = Object.keys(files).sort();
+  const encoder = new TextEncoder();
+  const versionHash = await sha256(encoder.encode(paths.map((p) => `${p}\0${files[p]}`).join("\n")));
+  const fileList = paths.length > INLINE_FILES
+    ? encoder.encode(JSON.stringify(Object.fromEntries(paths.map((p) => [p, files[p]]))))
+    : null;
+  if (fileList && fileList.byteLength > MAX_BLOB_BYTES) return fail(413, "file list exceeds the storage upload limit");
+  const manifest = fileList ? await sha256(fileList) : null;
+  const hashes = [...new Set(Object.values(files))];
   const title = body.title?.trim().slice(0, 300).toWellFormed();
   const note = body.note?.trim().slice(0, 1000).toWellFormed();
 
-  const present = new Set<string>();
-  let lifecycle = "";
   for (let attempt = 0; attempt < 5; attempt++) {
     const now = new Date().toISOString();
     const existing = await storedMeta(env, slug);
     if (existing && body.create) return fail(409, `slug "${slug}" is already taken`);
-    const meta: Meta = existing
-      ? existing.meta
-      : { slug, title: slug, createdAt: now, updatedAt: now, versions: [] };
-    const current = existing ? `${meta.gen ?? 0}:${meta.createdAt}` : "new";
-    if (current !== lifecycle) present.clear();
-    lifecycle = current;
-    const lock = await blocked(env, meta);
-    if (lock) return fail(409, lock);
-
-    const latest = meta.versions.at(-1);
-    const wantPrivate = typeof body.private === "boolean" ? body.private : Boolean(meta.private);
-    if (wantPrivate && !privateOn(env)) {
-      return fail(400, "private docs need PRIVATE_HOST, ACCESS_TEAM_DOMAIN and ACCESS_AUD set on the Worker");
+    const latest = existing?.meta.versions.at(-1);
+    const wantPrivate = typeof body.private === "boolean" ? body.private : Boolean(existing?.meta.private);
+    if (wantPrivate && !privateMode(env)) {
+      return fail(400, "private docs are not configured on this Worker");
     }
-    if (latest && latest.hash === versionHash && wantPrivate === Boolean(meta.private)) {
-      return json(receipt(docsOrigin(env, url, meta.private), meta, latest, true));
-    }
-    if (latest && latest.hash === versionHash) {
-      meta.private = wantPrivate;
-      meta.rev = (meta.rev ?? 0) + 1;
-      meta.updatedAt = now;
-      if (!(await saveMeta(env, meta, { etagMatches: existing!.etag }))) continue;
-      await notify(env, slug, liveState(meta), meta.private);
+    if (existing && latest?.hash === versionHash) {
+      const { meta } = existing;
+      if (wantPrivate !== Boolean(meta.private)) {
+        meta.private = wantPrivate;
+        meta.rev = (meta.rev ?? 0) + 1;
+        meta.updatedAt = now;
+        if (!(await saveMeta(env, meta, existing.etag))) continue;
+        await notify(env, slug, liveState(meta), meta.private);
+      }
       return json(receipt(docsOrigin(env, url, meta.private), meta, latest, true));
     }
 
-    const known = new Set(meta.versions.flatMap((v) => Object.values(v.files ?? {})));
-    const fresh = [...new Set(Object.values(files))].filter((h) => !known.has(h) && !present.has(h));
-    for (const hash of await store(env).hasBlobs(slug, fresh)) present.add(hash);
-    const missing = fresh.filter((h) => !present.has(h));
+    const doc = await store(env).document(slug);
+    if (doc?.deleting) return fail(409, `${slug} is being deleted; finish with tack rm ${slug}`);
+    const id = doc?.id;
+    if (existing && existing.meta.id !== id) continue;
+    const missing = id ? await blobs(env, id).missing(hashes) : hashes;
+    if (!missing) continue;
     if (missing.length) return json({ ok: false, error: "upload these files first", missing }, 428);
+    if (!id) continue;
+    const meta: Meta = existing?.meta ?? { slug, id, title: slug, createdAt: now, updatedAt: now, versions: [] };
 
     if (!existing) meta.gen = await nextGen(env, slug);
-    await compact(env, slug, meta.versions);
-    const version: Version = { n: Math.max(meta.lastN ?? 0, latest?.n ?? 0) + 1, at: now, hash: versionHash, size, files };
+    if (manifest && fileList) {
+      const result = await store(env).putBlob(slug, manifest, new Response(fileList).body, fileList.byteLength, id);
+      if (result === "changed") continue;
+      if (result !== "ok") throw new Error("file list digest mismatch");
+    }
+    const version: Version = {
+      n: Math.max(meta.lastN ?? 0, latest?.n ?? 0) + 1, at: now, hash: versionHash, size,
+      ...(manifest ? { manifest, count: paths.length } : { files }),
+    };
     if (note) version.note = note;
     meta.versions.push(version);
     meta.lastN = version.n;
     meta.rev = (meta.rev ?? 0) + 1;
-    delete meta.lock;
     meta.title = title || meta.title;
     meta.updatedAt = now;
     meta.private = wantPrivate;
 
-    const saved = await saveMeta(env, meta, existing ? { etagMatches: existing.etag } : { createOnly: true });
+    const saved = await saveMeta(env, meta, existing?.etag ?? null);
     if (saved) {
       await notify(env, slug, liveState(meta), meta.private);
       return json(receipt(docsOrigin(env, url, meta.private), meta, version, false), existing ? 200 : 201);
@@ -728,25 +664,10 @@ async function upload(req: Request, env: Env, url: URL, slug: string): Promise<R
   return fail(503, "too many concurrent uploads to this slug; retry");
 }
 
-async function compact(env: Env, slug: string, versions: Version[]) {
-  const bulky = versions.filter((v) => v.files && Object.keys(v.files).length > INLINE_FILES).slice(0, 50);
-  await Promise.all(
-    bulky.map(async (v) => {
-      const files = v.files!;
-      const body = new TextEncoder().encode(JSON.stringify(Object.fromEntries(Object.keys(files).sort().map((p) => [p, files[p]]))));
-      const hash = await sha256(body);
-      await store(env).putBlob(slug, hash, body.buffer as ArrayBuffer);
-      v.manifest = hash;
-      v.count = Object.keys(files).length;
-      delete v.files;
-    }),
-  );
-}
-
-async function filesOf(env: Env, ctx: ExecutionContext | null, slug: string, v: Version): Promise<Files | null> {
+async function filesOf(env: Env, ctx: ExecutionContext, id: string, v: Version): Promise<Files | null> {
   if (v.files) return Object.assign(Object.create(null), v.files);
   if (!v.manifest) return null;
-  const body = ctx ? await readBlob(env, ctx, slug, v.manifest) : await store(env).getBlob(slug, v.manifest);
+  const body = await readBlob(env, ctx, id, v.manifest);
   return body ? Object.assign(Object.create(null), await new Response(body).json()) : null;
 }
 
@@ -766,31 +687,19 @@ function receipt(origin: string, meta: Meta, v: Version, unchanged: boolean) {
   };
 }
 
-async function saveMeta(env: Env, meta: Meta, condition: MetaCondition): Promise<{ etag: string } | null> {
-  const etag = await store(env).saveMeta(JSON.stringify(meta), condition.etagMatches ?? null, Boolean(condition.createOnly));
-  return etag ? { etag } : null;
+function saveMeta(env: Env, meta: Meta, etag: string | null): Promise<boolean> {
+  return store(env).saveMeta(JSON.stringify(meta), etag);
 }
 
 async function remove(env: Env, slug: string): Promise<Response> {
-  const stored = SLUG_RE.test(slug) ? await storedMeta(env, slug) : null;
-  if (!stored) return fail(404, `no doc called "${slug}"`);
-  const meta = stored.meta;
-  if (meta.lock && Date.now() - meta.lock.at < LOCK_MS) return fail(409, `${slug} is ${meta.lock.reason}; retry in a moment`);
-  if (meta.lock?.to && meta.lock.phase !== "cleanup" && (await getMeta(env, meta.lock.to))?.lock?.from === slug) {
-    return fail(409, `an unfinished rename left a half-made copy at ${meta.lock.to}; run \`tack rm ${meta.lock.to}\` first, which keeps ${slug}`);
+  const result: RemoveResult = SLUG_RE.test(slug) ? await store(env).removeDoc(slug) : { status: "missing" };
+  if (result.status === "missing") return fail(404, `no doc called "${slug}"`);
+  if (result.status === "busy") return fail(409, `${slug} has an upload or delete in progress; retry`);
+  if (result.meta) {
+    const meta = JSON.parse(result.meta) as Meta;
+    await notify(env, slug, { gen: meta.gen ?? 0, rev: (meta.rev ?? 0) + 1, deleted: true }, meta.private);
   }
-  const locked = await saveMeta(env, { ...meta, lock: { reason: "being deleted", at: Date.now() } }, { etagMatches: stored.etag });
-  if (!locked) {
-    return fail(409, `${slug} changed while deleting; retry`);
-  }
-  await deleteBlobs(env, slug);
-  await store(env).deleteMeta(slug, locked.etag);
-  await notify(env, slug, { gen: meta.gen ?? 0, rev: (meta.rev ?? 0) + 1, deleted: true }, meta.private);
   return json({ ok: true, slug, deleted: true });
-}
-
-async function deleteBlobs(env: Env, slug: string) {
-  await store(env).deleteBlobs(slug);
 }
 
 async function removeVersion(env: Env, slug: string, n: number): Promise<Response> {
@@ -798,25 +707,14 @@ async function removeVersion(env: Env, slug: string, n: number): Promise<Respons
     const stored = SLUG_RE.test(slug) ? await storedMeta(env, slug) : null;
     if (!stored) return fail(404, `no doc called "${slug}"`);
     const meta = stored.meta;
-    const lock = await blocked(env, meta);
-    if (lock) return fail(409, lock);
     const i = meta.versions.findIndex((v) => v.n === n);
     if (i < 0) return fail(404, `${slug} has no version ${n}`);
     if (meta.versions.length === 1) return fail(400, `v${n} is the only version; use \`tack rm ${slug}\` to delete the doc`);
     const [gone] = meta.versions.splice(i, 1);
     meta.lastN = Math.max(meta.lastN ?? 0, gone.n);
-    const newest = meta.versions.at(-1)!;
-    if (!newest.files) {
-      const files = await filesOf(env, null, slug, newest);
-      if (files) {
-        newest.files = { ...files };
-        delete newest.manifest;
-        delete newest.count;
-      }
-    }
     meta.rev = (meta.rev ?? 0) + 1;
     meta.updatedAt = new Date().toISOString();
-    if (await saveMeta(env, meta, { etagMatches: stored.etag })) {
+    if (await saveMeta(env, meta, stored.etag)) {
       await notify(env, slug, liveState(meta), meta.private);
       return json({ ok: true, slug, deleted: n, latest: meta.versions.at(-1)!.n });
     }
@@ -829,58 +727,20 @@ async function rename(req: Request, env: Env, url: URL, slug: string): Promise<R
   if (!SLUG_RE.test(to) || RESERVED_SLUGS.has(to)) return fail(400, `"${to}" isn't a valid slug`);
   const stored = SLUG_RE.test(slug) ? await storedMeta(env, slug) : null;
   if (!stored) return fail(404, `no doc called "${slug}"`);
-  if (await storedMeta(env, to)) return fail(409, `slug "${to}" is already taken`);
   const meta = stored.meta;
-  const lock = await blocked(env, meta);
-  if (lock) return fail(409, lock);
-
-  const sourceLock = { reason: `being renamed to ${to}`, at: Date.now(), to };
-  const locked = await saveMeta(env, { ...meta, lock: sourceLock }, { etagMatches: stored.etag });
-  if (!locked) return fail(409, `${slug} changed while renaming; retry`);
-  const unlock = () => saveMeta(env, meta, { etagMatches: locked.etag }).catch(() => null);
-
   const moved: Meta = {
     ...meta,
     slug: to,
     gen: await nextGen(env, to),
     rev: (meta.rev ?? 0) + 1,
-    renamedFrom: { slug, gen: meta.gen ?? 0 },
   };
-  delete moved.lock;
-  const reserved = await saveMeta(
-    env,
-    { ...moved, lock: { reason: `being renamed from ${slug}`, at: Date.now(), from: slug } },
-    { createOnly: true },
-  );
-  if (!reserved) {
-    await unlock();
-    return fail(409, `slug "${to}" is already taken`);
+  if (!(await store(env).moveDoc(slug, JSON.stringify(moved), stored.etag))) {
+    return fail(409, `slug "${to}" is taken or ${slug} changed while renaming`);
   }
-  const abandon = async () => {
-    await deleteBlobs(env, to);
-    await store(env).deleteMeta(to, reserved.etag);
-    await unlock();
-  };
-  try {
-    if (!(await store(env).copyBlobs(slug, to, JSON.stringify(meta.versions)))) {
-      await abandon();
-      return fail(500, `${slug} is missing stored files; not renamed`);
-    }
-    if (!(await saveMeta(env, moved, { etagMatches: reserved.etag }))) {
-      await abandon();
-      return fail(409, `${to} changed while renaming; retry`);
-    }
-  } catch (err) {
-    await abandon().catch(() => null);
-    throw err;
-  }
-  await notify(env, to, liveState(moved), moved.private);
-
-  const cleanup = await saveMeta(env, { ...meta, lock: { ...sourceLock, at: Date.now(), phase: "cleanup" } }, { etagMatches: locked.etag });
-  if (!cleanup) return fail(500, `renamed to ${to}, but couldn't clean up ${slug}; run \`tack rm ${slug}\``);
-  await deleteBlobs(env, slug);
-  await store(env).deleteMeta(slug, cleanup.etag);
-  await notify(env, slug, { gen: meta.gen ?? 0, rev: (meta.rev ?? 0) + 1, moved: to }, meta.private);
+  await Promise.all([
+    notify(env, to, liveState(moved), moved.private),
+    notify(env, slug, { gen: meta.gen ?? 0, rev: (meta.rev ?? 0) + 1, moved: to }, meta.private),
+  ]);
   return json({ ok: true, from: slug, slug: to, url: `${docsOrigin(env, url, meta.private)}/${to}` });
 }
 
@@ -933,7 +793,7 @@ async function serveDoc(req: Request, env: Env, ctx: ExecutionContext, url: URL,
   } catch {
     return notFound();
   }
-  const files = await filesOf(env, ctx, slug, version);
+  const files = await filesOf(env, ctx, meta.id, version);
   if (!files) return notFound(`Missing file list for ${slug} v${version.n}.`, slug);
   const has = (p: string) => Object.hasOwn(files, p);
   if (path === "" || path.endsWith("/")) path += "index.html";
@@ -975,18 +835,20 @@ async function serveDoc(req: Request, env: Env, ctx: ExecutionContext, url: URL,
   });
   if (req.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers });
 
-  const body = await readBlob(env, ctx, slug, hash);
+  const body = await readBlob(env, ctx, meta.id, hash);
   if (!body) return notFound(`Missing blob for ${slug} v${version.n} “${path}”.`, slug);
   const res = new Response(body, { headers });
   return bar ? withVersionBar(res, bar) : res;
 }
 
-async function readBlob(env: Env, ctx: ExecutionContext, slug: string, hash: string): Promise<ReadableStream | null> {
-  const key = new Request(`https://blob.tack/${slug}/${hash}`);
+async function readBlob(env: Env, ctx: ExecutionContext, id: string, hash: string): Promise<ReadableStream | null> {
+  const key = new Request(`https://blob.tack/${id}/${hash}`);
   const hit = await caches.default.match(key);
   if (hit?.body) return hit.body;
-  const body = await store(env).getBlob(slug, hash);
-  if (!body) return null;
+  const blob = await blobs(env, id).get(hash);
+  if (!blob) return null;
+  const { body, size } = blob;
+  if (size > 8 * 1024 * 1024) return body;
   const [mine, cached] = body.tee();
   ctx.waitUntil(caches.default.put(key, new Response(cached, { headers: { "cache-control": "public, max-age=31536000, immutable" } })));
   return mine;
@@ -1286,7 +1148,7 @@ async function diffPage(env: Env, ctx: ExecutionContext, meta: Meta, url: URL): 
   const b = pick(url.searchParams.get("b")) ?? meta.versions.at(-1)!;
   const a = pick(url.searchParams.get("a")) ?? meta.versions[Math.max(0, meta.versions.indexOf(b) - 1)];
   const path = url.searchParams.get("path") || "index.html";
-  const [fa, fb] = await Promise.all([filesOf(env, ctx, meta.slug, a), filesOf(env, ctx, meta.slug, b)]);
+  const [fa, fb] = await Promise.all([filesOf(env, ctx, meta.id, a), filesOf(env, ctx, meta.id, b)]);
   if (!fa || !fb) return notFound(`Missing file list for ${meta.slug}.`, meta.slug);
   const [ha, hb] = [fa, fb].map((f) => (Object.hasOwn(f, path) ? f[path] : ""));
   const textual = (p: string) => /^(text\/|application\/(json|xml)|image\/svg)/.test(contentType(p));
@@ -1294,7 +1156,7 @@ async function diffPage(env: Env, ctx: ExecutionContext, meta: Meta, url: URL): 
     ha === hb
       ? { added: 0, removed: 0, html: "" }
       : textual(path)
-        ? await cachedDiff(env, ctx, meta.slug, ha, hb, /\.html?$/i.test(path))
+        ? await cachedDiff(env, ctx, meta.id, ha, hb, /\.html?$/i.test(path))
         : { added: 0, removed: 0, html: "", error: `${path} isn't a text file` };
 
   const files = [...new Set([...Object.keys(fa), ...Object.keys(fb)])].sort().flatMap((p) => {
@@ -1326,14 +1188,14 @@ async function diffPage(env: Env, ctx: ExecutionContext, meta: Meta, url: URL): 
 }
 
 type DiffResult = { added: number; removed: number; html: string; partial?: boolean; error?: string };
-const DIFF_REV = 6;
+const DIFF_REV = 7;
 const MAX_DIFF_BYTES = 100_000;
 const MAX_DIFF_LINES = 1000;
 
 async function cachedDiff(
   env: Env,
   ctx: ExecutionContext,
-  slug: string,
+  id: string,
   ha: string,
   hb: string,
   isHtml: boolean,
@@ -1343,12 +1205,13 @@ async function cachedDiff(
   if (hit) return hit.json<DiffResult>();
   let partial = false;
   const read = async (hash: string) => {
-    if (!hash || hash === EMPTY_SHA256) return [];
-    const body = await store(env).getBlob(slug, hash, MAX_DIFF_BYTES + 1);
-    if (!body) return null;
-    const bytes = new Uint8Array(await new Response(body).arrayBuffer());
-    if (bytes.byteLength > MAX_DIFF_BYTES) partial = true;
-    const text = new TextDecoder().decode(bytes.subarray(0, MAX_DIFF_BYTES), { stream: true });
+    if (!hash) return [];
+    const blob = await blobs(env, id).get(hash, MAX_DIFF_BYTES + 1);
+    if (!blob) return null;
+    const bytes = new Uint8Array(await new Response(blob.body).arrayBuffer());
+    const truncated = bytes.byteLength > MAX_DIFF_BYTES;
+    if (truncated) partial = true;
+    const text = new TextDecoder().decode(bytes.subarray(0, MAX_DIFF_BYTES), { stream: truncated });
     const lines = isHtml ? textLines(text) : text.split(/\r?\n/);
     if (!isHtml && lines.at(-1) === "") lines.pop();
     if (lines.length > MAX_DIFF_LINES) partial = true;
@@ -1502,15 +1365,17 @@ function decodeEntities(s: string): string {
   });
 }
 
-function loginPage(): Response {
+function loginPage(isPrivate = false): Response {
+  const command = isPrivate ? "tack open --private" : "tack open";
+  const options = isPrivate ? '{ method: "POST", headers: { authorization: "Bearer " + code } }' : '{ method: "POST", body: code }';
   const js = `(async () => {
   const code = location.hash.slice(1);
   history.replaceState(null, "", "/login");
   const say = (t) => (document.getElementById("s").textContent = t);
-  if (!code) return say("Run tack open for an unlock link.");
-  const res = await fetch("/login", { method: "POST", body: code });
+  if (!code) return say("Run ${command} for an unlock link.");
+  const res = await fetch("/login", ${options});
   if (res.ok) location.replace("/");
-  else say("That unlock link didn't work or has expired. Run tack open again.");
+  else say("That unlock link didn't work or has expired. Run ${command} again.");
 })();`;
   return html(page("tack", `<h1>📌 tack</h1><p class="m" id="s">Unlocking…</p><script>${js}</script>`));
 }

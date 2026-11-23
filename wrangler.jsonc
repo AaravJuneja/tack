@@ -8,11 +8,14 @@
   "preview_urls": false,
   "routes": [
     { "pattern": "tack.squeakyfiddlepro.me", "custom_domain": true },
-    { "pattern": "list.tack.squeakyfiddlepro.me", "custom_domain": true }
+    { "pattern": "list.tack.squeakyfiddlepro.me", "custom_domain": true },
+    { "pattern": "private.tack.squeakyfiddlepro.me", "custom_domain": true }
   ],
   "vars": {
     "DOCS_HOST": "tack.squeakyfiddlepro.me",
-    "LIST_HOST": "list.tack.squeakyfiddlepro.me"
+    "LIST_HOST": "list.tack.squeakyfiddlepro.me",
+    "PRIVATE_HOST": "private.tack.squeakyfiddlepro.me",
+    "PRIVATE_AUTH": "token"
   },
 
   "build": { "command": "bun run build" },
@@ -21,11 +24,13 @@
   "durable_objects": {
     "bindings": [
       { "name": "LIVE", "class_name": "Live" },
-      { "name": "STORE", "class_name": "Store" }
+      { "name": "STORE", "class_name": "Store" },
+      { "name": "BLOBS", "class_name": "Blobs" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Live"] },
-    { "tag": "v2", "new_sqlite_classes": ["Store"] }
+    { "tag": "v2", "new_sqlite_classes": ["Store"] },
+    { "tag": "v3", "new_sqlite_classes": ["Blobs"] }
   ]
 }

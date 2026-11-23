@@ -21,6 +21,7 @@ Usage:
   tack get <slug|url> [--v <n>]     print a doc's HTML to stdout
   tack list [--match <words>] [--json]  find docs by title or slug
   tack open [slug]                  open a doc in your browser; no slug: unlock the doc list
+  tack open --private               unlock private docs in your browser
   tack rm <slug> [--v <n>]          delete a doc, or just one version of it
   tack mv <slug> <new-slug>         rename a doc (old links stop working)
   tack update                       update this CLI (and the skill) from your instance
@@ -34,7 +35,7 @@ upload:
                (pick your own and the link is guessable; new docs get a random one)
   --new        always create a new doc (with --slug: fail if the slug is taken)
                with neither, re-uploading the same path updates the same doc
-  --private    serve it on the private host, behind Cloudflare Access
+  --private    serve it on the private host and require sign-in
   --public     make a private doc public again (otherwise a doc keeps its mode)
   --title <t>  doc title (default: the page's <title> or first <h1>)
   --note <n>   what changed in this version, shown in the history
@@ -171,7 +172,7 @@ async function upload(argv: string[]) {
   const copied = process.stdout.isTTY && (await copy(receipt.url));
   console.log(`${receipt.url}${copied ? "  (copied)" : ""}`);
   console.log(`  v${receipt.version} (${status}) · pinned: ${receipt.versionUrl}`);
-  if (receipt.private) console.log("  private: only opens after a Cloudflare Access sign-in");
+  if (receipt.private) console.log("  private: requires an authenticated browser");
   if (extras.length && !stdin && (await stat(abs)).isFile()) {
     const shown = extras.slice(0, 5).join(", ");
     console.log(`  + ${shown}${extras.length > 5 ? `, and ${extras.length - 5} more` : ""}`);
@@ -312,9 +313,14 @@ async function mv(argv: string[]) {
 }
 
 async function open(argv: string[]) {
-  const { values: o, positionals } = parseArgs({ args: argv, allowPositionals: true, options: common });
+  const { values: o, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: { ...common, private: { type: "boolean" } },
+  });
   const cfg = await loadConfig(o.url);
   const ref = positionals[0];
+  if (positionals.length > 1 || (o.private && ref)) throw new Error("usage: tack open [slug|url] or tack open --private");
   let target: string;
   if (ref && !/^https?:\/\//i.test(ref) && cfg.token) {
     const slug = ref.replace(/^\/+|\/+$/g, "");
@@ -322,10 +328,13 @@ async function open(argv: string[]) {
   } else if (ref) target = new URL(/^https?:\/\//i.test(ref) ? ref : `${cfg.url}/${ref.replace(/^\/+|\/+$/g, "")}/`).href;
   else {
     if (!cfg.token) throw new Error("no token yet (run `tack setup`)");
-    const { listUrl } = await api<{ listUrl: string | null }>(cfg, "/api/info");
-    if (!listUrl) throw new Error("this instance has no doc list (set LIST_HOST in wrangler.jsonc)");
+    const info = await api<{ listUrl: string | null; privateUrl?: string | null; privateUnlock?: boolean }>(cfg, "/api/info");
+    const base = o.private ? info.privateUrl : info.listUrl;
+    if (!base) throw new Error(o.private ? "this instance has no private docs" : "this instance has no doc list (set LIST_HOST in wrangler.jsonc)");
+    if (o.private && !info.privateUnlock) throw new Error("open the private doc directly to sign in through Cloudflare Access");
     const exp = Math.floor(Date.now() / 1000) + 600;
-    target = `${instanceUrl(listUrl)}/login#${exp}.${createHmac("sha256", cfg.token).update(`unlock:${exp}`).digest("hex")}`;
+    const purpose = o.private ? "unlock:private" : "unlock";
+    target = `${instanceUrl(base)}/login#${exp}.${createHmac("sha256", cfg.token).update(`${purpose}:${exp}`).digest("hex")}`;
   }
   if (!/^https?:$/.test(new URL(target).protocol)) throw new Error("can only open http(s) links");
   console.log(target);
